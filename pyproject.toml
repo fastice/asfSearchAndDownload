@@ -15,11 +15,15 @@ keywords = ["SAR", "Sentinel1"]
 requires-python = ">=3.8"
 
 dependencies = [
-    "argparse"
+    "argparse",
+    "asf-search"
 ]
 
 [tool.setuptools]
-packages = ["reduces1"]
+packages = ["reduces1", "reduces1.searchRegions"]
+
+[tool.setuptools.package-data]
+"reduces1.searchRegions" = ["*.lonlat"]
 
 [project.urls]
 Homepage = "https://github.com/fastice/reduceSentinel1"
@@ -27,4 +31,5 @@ Repository = "https://github.com/fastice/reduceSentinel1"
 
 [project.scripts]
 reduces1 = "reduces1.reduceSentinel1:main"
+searchASF = "reduces1.searchASF:main"
 
