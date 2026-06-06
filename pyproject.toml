@@ -3,15 +3,15 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "reduceSentinel1"
+name = "asfSearchAndDownload"
 version = "0.0.1"
-description = "Remove unneeded data from and S1 product"
+description = "Search and download utilities for ASF DAAC (NISAR, Sentinel-1)"
 authors = [
     { name = "Ian Joughin", email = "irj@uw.edu" }
 ]
 license = { text = "MIT" }
 readme = "README.md"
-keywords = ["SAR", "Sentinel1"]
+keywords = ["SAR", "Sentinel1", "NISAR", "ASF"]
 requires-python = ">=3.8"
 
 dependencies = [
@@ -20,16 +20,15 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["reduces1", "reduces1.searchRegions"]
+packages = ["asfsearchdownload", "asfsearchdownload.searchRegions"]
 
 [tool.setuptools.package-data]
-"reduces1.searchRegions" = ["*.lonlat"]
+"asfsearchdownload.searchRegions" = ["*.lonlat"]
 
 [project.urls]
-Homepage = "https://github.com/fastice/reduceSentinel1"
-Repository = "https://github.com/fastice/reduceSentinel1"
+Homepage = "https://github.com/fastice/asfSearchAndDownload"
+Repository = "https://github.com/fastice/asfSearchAndDownload"
 
 [project.scripts]
-reduces1 = "reduces1.reduceSentinel1:main"
-searchASF = "reduces1.searchASF:main"
-
+reduces1 = "asfsearchdownload.reduceSentinel1:main"
+searchASF = "asfsearchdownload.searchASF:main"

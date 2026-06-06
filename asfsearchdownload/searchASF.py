@@ -46,6 +46,15 @@ _ALL_MAX = 10000
 # are searched without a bandwidth constraint.
 _PAIR_PRODUCTS = frozenset({'RIFG', 'RUNW', 'ROFF', 'GUNW', 'GOFF'})
 
+# Pre-defined circumpolar search polygon for Antarctica.
+# Lon span = 360° > 180° so _wkt_to_cmr_spatial_params falls back to
+# bounding_box: -180,-90,180,-60 — covering the full Antarctic swath.
+_ANTARCTICA_WKT = (
+    'POLYGON((-180.0 -60.0,-90.0 -60.0,0.0 -60.0,90.0 -60.0,'
+    '180.0 -60.0,180.0 -90.0,90.0 -90.0,0.0 -90.0,-90.0 -90.0,'
+    '-180.0 -90.0,-180.0 -60.0))'
+)
+
 # Restricted NISAR Engineering Archival collections (require science-team auth).
 # These are NOT returned by a standard platform=NISAR search; we query them
 # separately via authenticated CMR when earthaccess is available.
@@ -68,6 +77,85 @@ def _wkt_to_cmr_polygon(wkt):
     return ','.join(tokens)
 
 
+def _wkt_to_cmr_spatial_params(wkt, max_vertices=200):
+    """Return CMR spatial params dict: {'polygon': ...} or {'bounding_box': ...}.
+
+    Falls back to bounding box when the polygon has > max_vertices vertices or
+    crosses the antimeridian (longitude span > 180°).  CMR cannot handle either.
+
+    For circumpolar polygons (lon span > 180°) the bbox spans the full longitude
+    range (-180 to 180) and extends to the pole, so searches like AllAntarctica
+    capture the full orbital swath rather than a partial sector.
+    """
+    inner = wkt.replace('POLYGON((', '').rstrip(')')
+    pairs = []
+    for pair_str in inner.split(','):
+        parts = pair_str.strip().split()
+        if len(parts) == 2:
+            try:
+                pairs.append((float(parts[0]), float(parts[1])))
+            except ValueError:
+                pass
+    if not pairs:
+        return {}
+
+    lons = [p[0] for p in pairs]
+    lats = [p[1] for p in pairs]
+    lon_span = max(lons) - min(lons)
+
+    if len(pairs) > max_vertices or lon_span > 180:
+        # Circumpolar polygon: span all longitudes; extend to the nearest pole
+        # so interior coverage (e.g. tracks over the South Pole) is not missed.
+        north_lat = max(lats)
+        south_lat = min(lats)
+        if south_lat < 0:
+            south_lat = -90.0   # extend to South Pole
+        else:
+            north_lat = 90.0    # extend to North Pole
+        bbox = f'-180.0000,{south_lat:.4f},180.0000,{north_lat:.4f}'
+        return {'bounding_box': bbox}
+
+    tokens = []
+    for lon, lat in pairs:
+        tokens.extend([str(lon), str(lat)])
+    return {'polygon': ','.join(tokens)}
+
+
+def _cmr_polygon_to_geojson(polygons_field):
+    """Convert CMR 'polygons' entry to a GeoJSON Polygon dict, or None.
+
+    CMR polygons is a list-of-lists of 'lat lon lat lon ...' strings.
+    GeoJSON wants [[lon, lat], ...] with the ring closed.
+    """
+    if not polygons_field:
+        return None
+    try:
+        ring_str = polygons_field[0][0]
+    except (IndexError, TypeError):
+        return None
+    tokens = ring_str.split()
+    if len(tokens) < 6 or len(tokens) % 2 != 0:
+        return None
+    coords = [[float(tokens[i + 1]), float(tokens[i])]   # lon, lat
+              for i in range(0, len(tokens), 2)]
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+    return {'type': 'Polygon', 'coordinates': [coords]}
+
+
+def _cmr_box_to_geojson(boxes_field):
+    """Convert CMR 'boxes' entry ('S W N E') to a GeoJSON Polygon dict, or None."""
+    if not boxes_field:
+        return None
+    try:
+        parts = boxes_field[0].split()
+        s, w, n, e = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+    except (IndexError, ValueError, TypeError):
+        return None
+    coords = [[w, s], [e, s], [e, n], [w, n], [w, s]]
+    return {'type': 'Polygon', 'coordinates': [coords]}
+
+
 def _search_nisar_ea(jwt, wkt, start, end, products, bandwidth):
     """Search restricted NISAR_EA collections via authenticated CMR.
 
@@ -76,7 +164,7 @@ def _search_nisar_ea(jwt, wkt, start, end, products, bandwidth):
       7:<frame>  8:<subframe>  9:<BW*100>  10:<pol>  11..14:<datetimes>
       15..<proc>  19:<ver>
 
-    Returns list of (url, track_int_or_None, frame_int_or_None).
+    Returns list of (url, track_int_or_None, frame_int_or_None, size_bytes, geom_or_None).
     """
     import requests as _req
 
@@ -93,7 +181,10 @@ def _search_nisar_ea(jwt, wkt, start, end, products, bandwidth):
         except ValueError:
             pass
 
-    cmr_polygon = _wkt_to_cmr_polygon(wkt)
+    spatial_params = _wkt_to_cmr_spatial_params(wkt)
+    if 'bounding_box' in spatial_params:
+        print('Note: using bounding_box fallback for CMR '
+              '(polygon crosses antimeridian or exceeds vertex limit)')
     items = []
 
     for concept_id in _NISAR_EA_COLLECTIONS:
@@ -106,7 +197,7 @@ def _search_nisar_ea(jwt, wkt, start, end, products, bandwidth):
                     'page_size': 2000,
                     'page_num':  page,
                     'temporal':  f'{start}T00:00:00Z,{end}T23:59:59Z',
-                    'polygon':   cmr_polygon,
+                    **spatial_params,
                 },
                 headers=headers,
                 timeout=120,
@@ -167,7 +258,11 @@ def _search_nisar_ea(jwt, wkt, start, end, products, bandwidth):
                 except (TypeError, ValueError):
                     size_bytes = 0
 
-                items.append((url, track, frame, size_bytes))
+                # Footprint geometry from CMR spatial fields
+                geom = (_cmr_polygon_to_geojson(entry.get('polygons'))
+                        or _cmr_box_to_geojson(entry.get('boxes')))
+
+                items.append((url, track, frame, size_bytes, geom))
 
             if len(entries) < 2000:
                 break
@@ -530,7 +625,7 @@ def _gpkg_record(url, track, frame, size_bytes, stem, status, url_to_geometry):
     search result — the parsed values may differ for EA items that have
     their own naming format.
     """
-    from reduces1.writeSearchGpkg import parse_nisar_meta
+    from asfsearchdownload.writeSearchGpkg import parse_nisar_meta
     meta = parse_nisar_meta(stem)
     # track/frame from the search result are authoritative; fill from
     # parsed stem only when the search result returned None.
@@ -643,6 +738,16 @@ Sentinel-1 beam modes:   IW EW S1 S2 S3 S4 S5 S6 WV
              '  *.shp               — ESRI shapefile (reprojected to WGS84)\n'
              '  other               — flat lon,lat coordinate file (GrIMP style)\n'
              'Default: bundled Greenland.lonlat',
+    )
+    parser.add_argument(
+        '--greenland', action='store_true', default=False,
+        help='Search over Greenland using the bundled Greenland.lonlat polygon '
+             '(equivalent to the default --searchArea)',
+    )
+    parser.add_argument(
+        '--antarctica', action='store_true', default=False,
+        help='Search over Antarctica (lon -180:180, lat -90:-60); '
+             'uses a full-longitude bounding box via CMR',
     )
 
     # --- archive deduplication ---
@@ -760,7 +865,14 @@ Sentinel-1 beam modes:   IW EW S1 S2 S3 S4 S5 S6 WV
     # ------------------------------------------------------------------
     # Build search
     # ------------------------------------------------------------------
-    wkt = read_polygon(args.searchArea)
+    if args.antarctica and args.greenland:
+        parser.error('--antarctica and --greenland are mutually exclusive')
+    if args.antarctica:
+        wkt = _ANTARCTICA_WKT
+    elif args.greenland:
+        wkt = read_polygon(_default_search_area())
+    else:
+        wkt = read_polygon(args.searchArea)
 
     MAX_RESULTS = 10000
 
@@ -829,7 +941,7 @@ Sentinel-1 beam modes:   IW EW S1 S2 S3 S4 S5 S6 WV
                  if fname.endswith('.h5')),
                 0,
             )
-        all_items.append((url, track, frame, size_bytes))
+        all_items.append((url, track, frame, size_bytes, None))
     print(f'ASF public: {len(results)} granule(s) found')
 
     # NISAR_EA restricted collections (only when authenticated via earthaccess)
@@ -872,12 +984,17 @@ Sentinel-1 beam modes:   IW EW S1 S2 S3 S4 S5 S6 WV
     # URL → footprint geometry map (for GeoPackage export).
     # asf_search results carry a .geometry GeoJSON dict; EA items do not.
     # ------------------------------------------------------------------
+    # Public asf_search results carry .geometry; EA items carry geometry in the
+    # 5th tuple element (extracted from CMR polygons/boxes fields).
     url_to_geometry = {}
     if args.gpkg:
         for result in results:
             _url = result.properties.get('url', '')
             if _url:
                 url_to_geometry[_url] = result.geometry
+        for item in all_items:
+            if len(item) == 5 and item[4] is not None:
+                url_to_geometry[item[0]] = item[4]
 
     # ------------------------------------------------------------------
     # Build archive index (if requested)
@@ -909,7 +1026,7 @@ Sentinel-1 beam modes:   IW EW S1 S2 S3 S4 S5 S6 WV
     try:
         out_fp = open(args.output, 'w')
 
-        for url, track, frame, size_bytes in all_items:
+        for url, track, frame, size_bytes, *_ in all_items:
 
             # Track / frame range filter
             if filter_track:
@@ -1021,7 +1138,7 @@ Sentinel-1 beam modes:   IW EW S1 S2 S3 S4 S5 S6 WV
         print('Volume: ' + '  '.join(vol_parts))
 
     if args.gpkg and gpkg_records:
-        from reduces1.writeSearchGpkg import write_search_gpkg
+        from asfsearchdownload.writeSearchGpkg import write_search_gpkg
         write_search_gpkg(args.gpkg, gpkg_records)
 
 

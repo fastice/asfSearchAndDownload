@@ -1,6 +1,6 @@
-# reduceSentinel1
+# asfSearchAndDownload
 
-Utilities for finding and reducing Sentinel-1 (and NISAR) archive data.
+Utilities for searching and downloading SAR products from the ASF DAAC (NISAR and Sentinel-1).
 
 **reduces1** removes unwanted files from Sentinel-1 ZIP archives by filename pattern. The primary use-case is stripping cross-polarisation (HV or VH) data from dual-pol SLC or L0 products, roughly halving the archive size for users who only need single-pol data. It has been tested successfully on both Sentinel-1 SLC and L0 products.
 
@@ -9,7 +9,7 @@ Utilities for finding and reducing Sentinel-1 (and NISAR) archive data.
 ## Installation
 
 ```bash
-pip install git+https://github.com/fastice/reduceSentinel1.git@main
+pip install git+https://github.com/fastice/asfSearchAndDownload.git@main
 ```
 
 ## Documentation
