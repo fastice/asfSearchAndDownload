@@ -30,5 +30,6 @@ Homepage = "https://github.com/fastice/asfSearchAndDownload"
 Repository = "https://github.com/fastice/asfSearchAndDownload"
 
 [project.scripts]
+ariaDownload = "asfsearchdownload.ariaDownload:main"
 reduces1 = "asfsearchdownload.reduceSentinel1:main"
 searchASF = "asfsearchdownload.searchASF:main"
