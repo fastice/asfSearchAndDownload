@@ -650,6 +650,8 @@ NISAR product choices:   L0B RSLC RIFG RUNW ROFF GSLC GCOV GUNW GOFF SME2
 NISAR bandwidths (MHz):  5 5+5 20 20+5 40 40+5 77
 Sentinel-1 products:     SLC GRD_HD GRD_MS GRD_HS GRD_FD GRD_MD OCN RAW BURST
 Sentinel-1 beam modes:   IW EW S1 S2 S3 S4 S5 S6 WV
+
+Part of the asfSearchAndDownload package.
 """,
     )
 

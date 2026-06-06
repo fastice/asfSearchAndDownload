@@ -39,7 +39,9 @@ def remove_files_from_zip(zip_path, pattern):
     
 
 def main():
-    parser = argparse.ArgumentParser(description="Remove files from ZIP archives by pattern.")
+    parser = argparse.ArgumentParser(
+        description="Remove files from ZIP archives by pattern.",
+        epilog='Part of the asfSearchAndDownload package.')
     parser.add_argument("zipfile", nargs="?", help="Path to a single ZIP file")
     parser.add_argument("--pattern", default="hv",
                         help="Pattern to match filenames to  [hv]")
