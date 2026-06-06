@@ -1,4 +1,4 @@
-# asfSearchAndDownload
+# ASF Search and Download
 
 Utilities for searching and downloading SAR products from the ASF DAAC (NISAR and Sentinel-1).
 
