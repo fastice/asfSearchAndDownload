@@ -144,6 +144,26 @@ _FIELD_DEFS = [
 ] if _HAVE_OGR else []
 
 
+def _choose_epsg(records):
+    """Pick EPSG from footprint latitudes: 3031 (Antarctica), 3413 (Arctic), 4326 (other)."""
+    lats = []
+    for rec in records:
+        geom = rec.get('geometry')
+        if not geom:
+            continue
+        for ring in geom.get('coordinates', []):
+            for coord in ring:
+                lats.append(coord[1])   # GeoJSON coords are [lon, lat]
+    if not lats:
+        return 4326
+    mean_lat = sum(lats) / len(lats)
+    if mean_lat < -60:
+        return 3031   # Antarctic polar stereographic
+    if mean_lat > 60:
+        return 3413   # North Polar Stereographic (NSIDC)
+    return 4326
+
+
 def write_search_gpkg(gpkg_path, records):
     """Write search results to a GeoPackage with one layer per product type.
 
@@ -197,8 +217,18 @@ def write_search_gpkg(gpkg_path, records):
     driver = ogr.GetDriverByName('GPKG')
     ds = driver.CreateDataSource(gpkg_path)
 
+    target_epsg = _choose_epsg(list(rec for recs in by_product.values() for rec in recs))
     srs = osr.SpatialReference()
-    srs.ImportFromEPSG(4326)
+    srs.ImportFromEPSG(target_epsg)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+    if target_epsg != 4326:
+        src_srs = osr.SpatialReference()
+        src_srs.ImportFromEPSG(4326)
+        src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        _transform = osr.CoordinateTransformation(src_srs, srs)
+    else:
+        _transform = None
 
     total_features = 0
     for product_type in sorted(by_product.keys()):
@@ -217,10 +247,12 @@ def write_search_gpkg(gpkg_path, records):
         for rec in items:
             feat = ogr.Feature(layer_defn)
 
-            # Geometry
+            # Geometry — reproject from WGS84 to target CRS if needed
             geom = ogr.CreateGeometryFromJson(json.dumps(rec['geometry']))
             if geom is None:
                 continue
+            if _transform:
+                geom.Transform(_transform)
             feat.SetGeometry(geom)
 
             # Scalar fields
@@ -241,5 +273,5 @@ def write_search_gpkg(gpkg_path, records):
         f'{pt}×{len(items)}'
         for pt, items in sorted(by_product.items())
     )
-    print(f'GeoPackage: {gpkg_path}')
+    print(f'GeoPackage: {gpkg_path}  (EPSG:{target_epsg})')
     print(f'  {total_features} feature(s) in {len(by_product)} layer(s): {layer_summary}')

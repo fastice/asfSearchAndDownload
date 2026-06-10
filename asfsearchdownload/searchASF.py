@@ -156,7 +156,7 @@ def _cmr_box_to_geojson(boxes_field):
     return {'type': 'Polygon', 'coordinates': [coords]}
 
 
-def _search_nisar_ea(jwt, wkt, start, end, products, bandwidth):
+def _search_nisar_ea(jwt, wkt, start, end, products, bandwidth, use_s3=False):
     """Search restricted NISAR_EA collections via authenticated CMR.
 
     Field layout of NISAR granule name (split on '_'):
@@ -229,12 +229,16 @@ def _search_nisar_ea(jwt, wkt, start, end, products, bandwidth):
                     if bw_val is not None and bw_val not in bw_codes:
                         continue
 
-                # Pick the HTTPS data link (.h5 file)
+                # Pick the data link (.h5 file): S3 or HTTPS
                 url = None
                 for lnk in entry.get('links', []):
                     rel  = lnk.get('rel', '')
                     href = lnk.get('href', '')
-                    if ('fedsearch/1.1/data#' in rel
+                    if use_s3:
+                        if href.startswith('s3://') and href.endswith('.h5'):
+                            url = href
+                            break
+                    elif ('fedsearch/1.1/data#' in rel
                             and href.startswith('https://')
                             and href.endswith('.h5')):
                         url = href
@@ -312,6 +316,25 @@ def _strip_ext(name):
         if name.endswith(ext):
             return name[:-len(ext)]
     return name
+
+
+def _extract_url(result, use_s3):
+    """Return the download URL for an asf_search result (HTTPS or S3).
+
+    When use_s3 is True, searches UMM RelatedUrls for an s3:// .h5 link,
+    then falls back to result.properties['s3Urls'].  Returns '' if S3 is
+    not available for this granule.
+    """
+    if not use_s3:
+        return result.properties.get('url', '')
+    for rel_url in (result.umm or {}).get('RelatedUrls', []):
+        href = rel_url.get('URL', '')
+        if href.startswith('s3://') and href.endswith('.h5'):
+            return href
+    s3_list = result.properties.get('s3Urls') or []
+    if s3_list:
+        return s3_list[0]
+    return ''
 
 
 def _nisar_bw_field(parts):
@@ -773,6 +796,13 @@ Part of the asfSearchAndDownload package.
              '(newer version available).  Example: --gpkg search.gpkg',
     )
 
+    # --- S3 direct access ---
+    parser.add_argument(
+        '--s3', action='store_true', default=False,
+        help='Output S3 URIs (s3://…) instead of HTTPS URLs. '
+             'Granules without an available S3 link are silently skipped.',
+    )
+
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -927,7 +957,9 @@ Part of the asfSearchAndDownload package.
     all_items = []
     for result in results:
         props      = result.properties
-        url        = props.get('url', '')
+        url        = _extract_url(result, args.s3)
+        if not url:
+            continue
         track      = _to_int(props.get('pathNumber'))
         frame      = _to_int(props.get('frameNumber'))
         # bytes dict: {filename: {'bytes': N, 'format': '...'}, ...}
@@ -955,6 +987,7 @@ Part of the asfSearchAndDownload package.
                 _jwt, wkt,
                 args.firstDate, args.lastDate,
                 args.products, args.bandwidth,
+                use_s3=args.s3,
             )
         except Exception as _ea_err:
             print(f'\nWarning: NISAR_EA search failed ({_ea_err}); '

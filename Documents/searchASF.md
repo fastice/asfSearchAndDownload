@@ -33,8 +33,11 @@ searchASF [options] firstDate lastDate output
 | `--startFrame N` | 0 | Minimum frame number. |
 | `--endFrame N` | 10000 | Maximum frame number. |
 | `--searchArea FILE` | bundled `Greenland.lonlat` | Search polygon file (see **Search area formats** below). |
+| `--greenland` | — | Search over Greenland using the bundled `Greenland.lonlat` polygon (equivalent to the default `--searchArea`). |
+| `--antarctica` | — | Search over Antarctica (lon −180:180, lat −90:−60) using a full-longitude bounding box. Mutually exclusive with `--greenland`. |
 | `--archiveDir GLOB` | None | Glob pattern for already-downloaded files. Matching granules are skipped; for NISAR, newer-version URLs are written to `output.updated`. |
 | `--gpkg FILE` | None | Write granule footprints to a GeoPackage (one QGIS layer per product type). |
+| `--s3` | off | Output S3 URIs (`s3://…`) instead of HTTPS URLs. Granules with no available S3 link are silently skipped. See **S3 access** below. |
 
 ---
 
@@ -42,11 +45,13 @@ searchASF [options] firstDate lastDate output
 
 | File | Contents |
 |------|----------|
-| `output` | HTTPS URLs for new (not-yet-archived) granules, one per line |
+| `output` | Download URLs/URIs for new (not-yet-archived) granules, one per line |
 | `output.<PRODUCT>` | Per-product subset of `output` (e.g. `output.RUNW`, `output.ROFF`) |
-| `output.exists` | URLs for granules already present in `--archiveDir` |
-| `output.updated` | NISAR URLs where a newer processor version exists in the archive |
+| `output.exists` | URLs/URIs for granules already present in `--archiveDir` |
+| `output.updated` | NISAR URLs/URIs where a newer processor version exists in the archive |
 | `output.gpkg` | GeoPackage footprints (when `--gpkg` is given) |
+
+All output files contain HTTPS URLs by default, or S3 URIs when `--s3` is given.
 
 ---
 
@@ -100,6 +105,46 @@ Search Sentinel-1 IW SLC over Greenland:
 searchASF 2025-01-01 2025-12-31 s1_2025.txt \
     --sensor SENTINEL1 --products SLC --beamMode IW
 ```
+
+Search for NISAR over Antarctica:
+```
+searchASF 2025-01-01 2025-12-31 nisar_ant.txt \
+    --antarctica --products RUNW ROFF
+```
+
+Retrieve S3 URIs instead of HTTPS URLs:
+```
+searchASF 2025-01-01 2025-12-31 nisar_s3.txt \
+    --products RUNW ROFF --s3
+```
+
+---
+
+## S3 access
+
+When `--s3` is given, output files contain `s3://` URIs instead of HTTPS URLs. These URIs point to the same granules in the ASF DAAC cloud archive (AWS `us-west-2`).
+
+**Authentication**: S3 access requires temporary AWS credentials obtained from Earthdata Login. Use [earthaccess](https://earthaccess.readthedocs.io/) to retrieve them:
+
+```python
+import earthaccess, boto3
+
+earthaccess.login(strategy='netrc', persist=False)
+creds = earthaccess.get_s3_credentials(daac='ASF')
+
+s3 = boto3.client('s3',
+    aws_access_key_id=creds['accessKeyId'],
+    aws_secret_access_key=creds['secretAccessKey'],
+    aws_session_token=creds['sessionToken'],
+    region_name='us-west-2',
+)
+bucket, key = uri[5:].split('/', 1)   # strip s3://
+s3.download_file(bucket, key, local_path)
+```
+
+Credentials expire after 1 hour; refresh them for long batch downloads.
+
+**When S3 is faster**: S3 access is significantly faster than HTTPS only when running on AWS EC2 in `us-west-2` (same region as the DAAC buckets). From a non-AWS HPC or workstation the data traverses the internet either way, and aria2c over HTTPS is typically comparable in speed.
 
 ---
 
