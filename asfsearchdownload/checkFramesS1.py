@@ -26,17 +26,17 @@ import re
 import shutil
 from datetime import datetime, timedelta
 
-import yaml
 import utilities as u
 
 from asfsearchdownload import refreshOrbits
+from asfsearchdownload import queueS1
 
 BURST_PERIOD = 2.759          # seconds per S1 IW burst (from checkframes.py)
 MAX_FRAMES = 127              # processor limit; > 127 in-range bursts must split
 DEFAULT_FRAME_RANGE = [300, 750]
 GAP_SUFFIX_START = 1         # far-side gap segments -> <orbit>_1, _2, _3, ...
 SPLIT_SUFFIX = 4             # long-split head       -> <orbit>_4
-QUEUES = ('toProcess', 'pendingProcessing', 'problem')
+QUEUES = queueS1.QUEUES
 QUEUE_LABEL = {'toProcess': 'toProcess', 'pendingProcessing': 'pending',
                'problem': 'problem'}
 
@@ -334,42 +334,45 @@ def routeUnit(trackDir, unitName, rows, residual, orbitDir):
 
 # --------------------------------------------------------------------------- #
 # cumulative, idempotent queue files
+#
+# The format itself lives in queueS1 so setupTrack (s1setup) can consume the
+# queues without importing this module. Re-exported here under the old names.
 # --------------------------------------------------------------------------- #
-def queuePath(queueDir, name):
-    return os.path.join(queueDir, f'{name}.yaml')
+queuePath = queueS1.queuePath
+entryUnit = queueS1.entryUnit
+readQueue = queueS1.readQueue
+writeQueues = queueS1.writeQueues
 
 
-def entryUnit(entry):
-    ''' The unit identifier of a queue entry (record dict or legacy string). '''
-    return entry['unit'] if isinstance(entry, dict) else entry
+def newDeltas():
+    ''' Empty delta accumulator for applyQueueDeltas. '''
+    return {'add': {name: [] for name in QUEUES},
+            'remove': {name: [] for name in QUEUES}}
 
 
-def readQueue(queueDir, name):
-    path = queuePath(queueDir, name)
-    if not os.path.exists(path):
-        return []
-    with open(path) as fp:
-        data = yaml.safe_load(fp)
-    return data if isinstance(data, list) else []
+def queueUnit(queues, newEntries, deltas, queue, record, reason=None,
+              source='checkFramesS1'):
+    ''' Add one record to a queue, recording it for the caller and for the
+    on-disk delta. problem entries carry the reason as their comment. '''
+    if queue == 'problem':
+        record = queueS1.problemRecord(record['unit'], reason or 'problem',
+                                       source, base=record)
+    unit = entryUnit(record)
+    if unit not in {entryUnit(e) for e in queues[queue]}:
+        queues[queue].append(record)
+    newEntries[queue].append(record)
+    deltas['add'][queue].append(record)
+    return record
 
 
-def writeQueues(queueDir, queues):
-    ''' Write each queue file as a unit-deduped, unit-sorted list. This is a full
-    rewrite, so entries removed in memory (e.g. promoted out of pendingProcessing)
-    are dropped from disk. '''
-    for name in QUEUES:
-        byUnit = {}
-        for e in queues[name]:
-            byUnit.setdefault(entryUnit(e), e)
-        merged = [byUnit[u] for u in sorted(byUnit)]
-        with open(queuePath(queueDir, name), 'w') as fp:
-            yaml.safe_dump(merged, fp, default_flow_style=False, sort_keys=False)
-
-
-def promotePending(queues, assemblyDir, orbitDir, check):
+def promotePending(queues, newEntries, deltas, assemblyDir, orbitDir, check):
     ''' Re-evaluate every pendingProcessing unit against the current state and
     move any whose status changed (typically its orbit arrived) out of pending
-    into toProcess (or problem). Mutates queues in place; returns the count moved. '''
+    into toProcess (or problem). Mutates queues in place; returns the count moved.
+
+    Promotions land in newEntries too, so a unit that becomes a problem here is
+    visible to the caller (and therefore to the notification) rather than only
+    being printed. '''
     stillPending = []
     moved = 0
     for rec in queues['pendingProcessing']:
@@ -394,13 +397,70 @@ def promotePending(queues, assemblyDir, orbitDir, check):
         if queue in (None, 'pendingProcessing'):
             stillPending.append(rec)          # still waiting (or now ignored)
             continue
-        newRec = unitRecord(trackName, unitName, rows, frameRange)
-        if unit not in {entryUnit(e) for e in queues[queue]}:
-            queues[queue].append(newRec)
+        queueUnit(queues, newEntries, deltas, queue,
+                  unitRecord(trackName, unitName, rows, frameRange), reason)
+        deltas['remove']['pendingProcessing'].append(unit)
         print(f'{unit}: pendingProcessing -> {queue} ({reason})')
         moved += 1
     queues['pendingProcessing'] = stillPending
     return moved
+
+
+def promoteProblem(queues, newEntries, deltas, assemblyDir, orbitDir, check):
+    ''' Re-evaluate every problem unit and drop it once the condition clears.
+
+    Without this the problem queue is append-only and the caller's "already
+    queued" rule means a unit in it is never re-routed -- so a transient (or one
+    fixed by hand) stays stuck for ever, and having been notified once, silently.
+    Returns the count cleared. '''
+    stillProblem = []
+    cleared = 0
+    for rec in queues['problem']:
+        unit = entryUnit(rec)
+        if '/' not in unit:
+            stillProblem.append(rec)
+            continue
+        trackName, unitName = unit.split('/', 1)
+        trackDir = os.path.join(assemblyDir, trackName)
+        unitPath = os.path.join(trackDir, unitName)
+        # Never drop an entry just because the unit is not readable: that is how
+        # a wrong assemblyDir would quietly empty the queue.
+        if not glob.glob(f'{unitPath}/*.SAFE'):
+            stillProblem.append(rec)
+            continue
+        if isProcessed(trackDir, unitName):
+            deltas['remove']['problem'].append(unit)
+            print(f'{unit}: problem -> processed, cleared')
+            cleared += 1
+            continue
+        frameRange = readFrameRange(trackDir)
+        try:
+            rows = getOrbitSafe(unitPath, getAscNodeTime(unitPath, check))
+        except Exception:
+            stillProblem.append(rec)
+            continue
+        residual = residualForDir(unitPath, frameRange, check)
+        queue, reason = routeUnit(trackDir, unitName, rows, residual, orbitDir)
+        if queue == 'problem':
+            stillProblem.append(rec)
+            # Refresh the comment only for our own entries: routeUnit reports the
+            # generic 'previous run Failed' for the marker setupTrack writes,
+            # which would otherwise clobber its specific failure detail.
+            if (isinstance(rec, dict) and reason != rec.get('comment')
+                    and rec.get('source', 'checkFramesS1') == 'checkFramesS1'):
+                deltas.setdefault('update', {}).setdefault('problem', {})[unit] \
+                    = {'comment': reason, 'notified': None}
+            continue
+        if queue is None:
+            stillProblem.append(rec)          # Ignore file / no SAFE: leave it
+            continue
+        deltas['remove']['problem'].append(unit)
+        queueUnit(queues, newEntries, deltas, queue,
+                  unitRecord(trackName, unitName, rows, frameRange), reason)
+        print(f'{unit}: problem -> {queue} ({reason})')
+        cleared += 1
+    queues['problem'] = stillProblem
+    return cleared
 
 
 # --------------------------------------------------------------------------- #
@@ -435,10 +495,14 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
     opts = {'check': check, 'noSplit': noSplit, 'noBreakGap': noBreakGap,
             'noMoveOutOfRange': noMoveOutOfRange}
 
-    queues = {name: readQueue(queueDir, name) for name in QUEUES}
-    promoted = promotePending(queues, assemblyDir, orbitDir, check)
-    seen = {entryUnit(e) for name in QUEUES for e in queues[name]}
+    queues = queueS1.readQueues(queueDir)
     newEntries = {name: [] for name in QUEUES}
+    deltas = newDeltas()
+    promoted = promotePending(queues, newEntries, deltas, assemblyDir, orbitDir,
+                              check)
+    cleared = promoteProblem(queues, newEntries, deltas, assemblyDir, orbitDir,
+                             check)
+    seen = {entryUnit(e) for name in QUEUES for e in queues[name]}
 
     for trackDir in trackDirs:
         trackName = os.path.basename(trackDir)
@@ -454,7 +518,15 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
             try:
                 asc = getAscNodeTime(path, check)
             except Exception as exc:
+                # An orbit dir that cannot even be vetted would otherwise be
+                # skipped silently and never processed, so queue it as a problem.
                 print(f'{trackName}/{entry}: cannot read ascending node ({exc})')
+                rel = f'{trackName}/{entry}'
+                if rel not in seen:
+                    queueUnit(queues, newEntries, deltas, 'problem',
+                              {'unit': rel, 'orbit': entry},
+                              f'cannot read ascending node: {exc}')
+                    seen.add(rel)
                 continue
             if firstDate <= asc <= lastDate:
                 orbitList.append((int(entry), asc))
@@ -484,6 +556,13 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
                     trackDir, orbit, frameRange, opts)
             except Exception as exc:
                 print(f'{trackName}/{orbit}: analysis error ({exc})')
+                rel = f'{trackName}/{orbit}'
+                if rel not in seen:
+                    queueUnit(queues, newEntries, deltas, 'problem',
+                              {'unit': rel, 'orbit': str(orbit),
+                               'date': f'{asc:%Y-%m-%d}'},
+                              f'analysis error: {exc}')
+                    seen.add(rel)
                 continue
             if not check:
                 executeMoves(trackDir, moves, toTmp)
@@ -504,9 +583,9 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
                                               residual.get(unitName), orbitDir)
                     tag = f'{QUEUE_LABEL.get(queue, "skip")} ({reason})'
                     if queue:
-                        record = unitRecord(trackName, unitName, rows, frameRange)
-                        newEntries[queue].append(record)
-                        queues[queue].append(record)
+                        queueUnit(queues, newEntries, deltas, queue,
+                                  unitRecord(trackName, unitName, rows,
+                                             frameRange), reason)
                         seen.add(rel)
                 display[unitName] = (frames, tag)
 
@@ -524,12 +603,18 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
                 print(f'    {nOOR} SAFE out of range [{lo},{hi}]')
 
     if not check:
-        writeQueues(queueDir, queues)
+        # Deltas, not a whole-file rewrite: this run read the queues minutes ago
+        # and setupTrack may have consumed entries since, which a snapshot write
+        # would silently undo.
+        if queueS1.applyQueueDeltas(queueDir, **deltas) is None:
+            u.mywarning('checkFramesS1: another writer holds the queue lock; '
+                        'no queue changes were written')
     total = sum(len(v) for v in newEntries.values())
     verb = 'would queue' if check else 'queued'
     print(f'{verb} {total} new unit(s): '
           + ', '.join(f'{k} {len(newEntries[k])}' for k in QUEUES)
-          + (f'; promoted {promoted} from pending' if promoted else ''))
+          + (f'; promoted {promoted} from pending' if promoted else '')
+          + (f'; cleared {cleared} from problem' if cleared else ''))
     return newEntries
 
 

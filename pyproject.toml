@@ -16,7 +16,9 @@ requires-python = ">=3.8"
 
 dependencies = [
     "argparse",
-    "asf-search"
+    "asf-search",
+    "pyyaml",
+    "utilities"
 ]
 
 [tool.setuptools]

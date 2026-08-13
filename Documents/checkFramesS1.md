@@ -51,6 +51,27 @@ is a record:
   totalFrames: 127            # in-range burst count
 ```
 
+`problem` entries carry three more keys, plus a fourth once notified:
+
+```yaml
+  comment: over-length              # why it is a problem
+  source: checkFramesS1             # which tool queued it (or setupTrack)
+  found: '2026-08-13T02:14:07'      # when
+  notified: true                    # absent until an email has actually gone out
+```
+
+Entries queued **before** a unit's frame extent is known — an unreadable
+ascending node, an analysis error, a unit dir that has vanished — carry only
+`unit`/`orbit`/`comment`/`source`/`found`. **Consumers must key off `unit`
+alone.** Entries from older runs may also be a bare string rather than a dict.
+
+The format lives in `queueS1.py`, deliberately free of heavy imports so
+`s1setup.setupTrack` can consume the queues without paying `checkFramesS1`'s
+~2.5 s import. Writers go through `queueS1.applyQueueDeltas()`, which re-reads
+the queues under a lock and applies only the caller's own changes — a full
+rewrite from a stale snapshot would silently undo a concurrent writer such as
+`setupTrack --queue`.
+
 | Queue | Meaning |
 |---|---|
 | `toProcess.yaml` | Passes all checks **and** a precise (EOF) orbit covering the acquisition exists in `orbitDir`. |
@@ -61,6 +82,19 @@ is a record:
 re-evaluated; if its status changed (typically the EOF orbit has since arrived) it
 is moved out of pending into `toProcess` (or `problem`). This is how a pass
 downloaded before its orbit was ready eventually becomes processable.
+
+**Problem clearing.** Each `problem` unit is likewise re-evaluated every run and
+**removed once the condition clears** — the gap was fixed by hand, the unit was
+processed, or it now routes elsewhere. Without this the queue would be
+append-only, and because a unit sitting in any queue is never re-routed, a
+transient problem would be stuck for ever after being reported once. A unit
+whose directory is unreadable is deliberately **left in place** rather than
+cleared: that is how a wrong `assemblyDir` would otherwise empty the queue.
+
+A problem entry's `comment` is refreshed when the reason changes, but only for
+entries this tool queued — `setupTrack`'s specific failure detail ("setup failed
+at runPreProcTops") must not be overwritten by the generic `previous run Failed`
+that the `Failed` marker produces here.
 
 A unit carrying an `Ignore` file is **skipped** (not queued). A unit already
 **fully processed** (a `Completed` marker or its `{orbit}-{seq}` output dir exists,

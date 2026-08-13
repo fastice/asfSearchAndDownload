@@ -26,7 +26,21 @@ and `autoupdate.yaml` will grow to carry their config.
    (no leftover `.aria2` control file and `zipfile.is_zipfile` passes); on
    failure it is re-downloaded up to `maxAttempts`. On success the unneeded
    cross-pol is stripped (`reduceSentinel1`) in a **background thread** while the
-   next download starts.
+   next download starts. Granules that exhaust `maxAttempts` are remembered and
+   given one **retry pass at the end of the download stage** — a whole-pass
+   failure is usually a brief ASF-side outage that has cleared by then. The
+   `--maxDownloads` cap does not apply to the retry pass (those granules were
+   already inside the cap), and recoveries are folded back into the summary
+   counts, so `failed N` reports only what is still missing after the retry.
+
+   **Concurrent filing.** Once a granule's reduce returns, it is handed straight
+   to a small pool of filing workers (`fileWorkers`, default 2) that unzip it
+   into the assembly tree while the *next* granule downloads. Unzipping (~88 s)
+   is faster than downloading (~155 s), so stage 4 costs almost nothing on a
+   normal run. The hand-off is the statement after `remove_files_from_zip`
+   returns, which is what guarantees a zip is never unzipped while `zip -d` is
+   rewriting it in place. Disable with `--noFileDuringDownload` to get the old
+   download-everything-then-file behaviour.
 
 A pass already present anywhere under `archiveDir/<YYYY>-<MM>/` as `.zip` or
 `.zip.1` (the `.1` marks an already-processed pass) is not re-downloaded.
@@ -49,6 +63,31 @@ A pass already present anywhere under `archiveDir/<YYYY>-<MM>/` as `.zip` or
    goes to `pendingProcessing`; at the start of each run those are re-checked and
    promoted to `toProcess` once the orbit arrives. Run in isolation with
    `--checkFrames`. See [checkFramesS1](checkFramesS1.md).
+6. **Assemble.** With `assemble: true`, the queued units are pushed through
+   `setupTrack --queue` (see [setupTrack](../../s1setup/Documents/setupTrack.md)),
+   which runs the 5-step preprocessing pipeline for each one, consumes it from
+   `toProcess`, records it in `processed.<date>.yaml`/`completed.yaml`, and
+   routes failures to `problem.yaml` with the failing step as the comment.
+   Run in isolation with `--assembleOnly`; skip with `--noAssemble`.
+
+   `setupTrack` is invoked as a **subprocess**, not imported: `s1setup` already
+   depends on this package for the queue format, so importing it here would make
+   the dependency circular. It is on `PATH` as a console script, the same way
+   `searchASF` and `ariaDownload` are called.
+
+   **This stage is what keeps the disk from filling.** A filed-but-unassembled
+   unit carries ~30 GB of measurement TIFFs; assembling it strips them (the
+   source `.zip.1` is kept, so the unit can still be re-filed and reprocessed),
+   taking it to ~100 MB. At ~37 units a night that is roughly 1.1 TB/night
+   reclaimed. Disable stripping with `noStripTiffs: true` if you need in-place
+   `--overWrite` reprocessing, but budget the space.
+
+## Free-space alarm
+
+After the stages run, the free space on the volume holding `assemblyDir` is
+recorded in the summary. If it falls below `minFreeTB` (default 6), the run logs
+`LOW DISK`, adds a note to the summary, and **mails it** — a third trigger
+alongside failed downloads and new problem units, still exactly one email.
 
 ## Sensors
 
@@ -87,6 +126,9 @@ autoupdateS1 [config] [options]
                     assemblyDir track tree (skips orbits + search/download)
   --checkFrames     Run only the frame-check step: vet filed datatakes and
                     queue them (skips orbits + search/download + filing)
+  --assembleOnly    Run only the assemble step: push the queued units through
+                    setupTrack (skips every earlier stage)
+  --noAssemble      Skip the assemble step even when the config enables it
   --check           Dry run across every stage: report what would be
                     downloaded, filed, or written without modifying anything on
                     disk (search results go to a scratch temp dir; the archive
@@ -114,6 +156,14 @@ direction:  both           # both | ascending | descending [both]
 # maxDownloads: 300        # soft cap per run (0 = no limit); finishes the pass [300]
 # reducePattern: hv        # cross-pol substring to strip (Greenland HH+HV) [hv]
 # maxAttempts: 3           # download retries per pass [3]
+# fileWorkers: 2           # concurrent unzips while downloading [2]
+#                          #   (to turn it off use --noFileDuringDownload)
+# assemble: true           # run stage 6 (setupTrack) after the frame check [off]
+# assembleMaxUnits: 0      # cap units assembled per run (0 = drain the queue)
+# noStripTiffs: false      # keep measurement TIFFs after processing [strip them]
+# minFreeTB: 6             # email when the assembly volume drops below this [6]
+# notifyEmail: irj@uw.edu  # who to mail on unrecovered failures (opt-in;
+#                          #   with no key nothing is ever mailed)
 ```
 
 Only `archiveDir` is strictly required; a spatial constraint (`region` or
@@ -126,13 +176,20 @@ finishes after download — so existing configs keep working unchanged.
 ## Locking (multi-machine safe)
 
 The project may be reachable from several machines over NFS, so the run holds
-cross-host lock files **beside `autoupdate.yaml`** (not in `/tmp` or `/var`, which
-are per-host). Because NFS `flock`/`fcntl` is unreliable, the lock is an atomic
-`O_EXCL` lock file:
+cross-host lock files on the shared tree (not in `/tmp` or `/var`, which are
+per-host). Because NFS `flock`/`fcntl` is unreliable, the lock is an atomic
+`O_EXCL` lock file. **Each lock lives beside the thing it guards:**
 
-- `autoupdateS1_download.lock` — held during **search + download**.
-- `autoupdateS1_file.lock` — held during **filing and the frame check** (both
-  write the assembly tree).
+- `<projectDir>/autoupdateS1_download.lock` — held during **search + download**;
+  it guards `archiveDir`, which is per-project.
+- `<assemblyDir>/.assemblyTree.lock` — held during **filing and the frame check**
+  (both write the assembly tree), and across the whole download stage when
+  filing concurrently.
+
+The assembly lock sits in `assemblyDir` rather than the project dir so that any
+tool given `--assemblyDir` can take it — notably `s1setup.setupTrack --queue`,
+which has no way to find the project dir. Without that, `checkFramesS1` could
+`shutil.move` a SAFE out from under a running `setupTrack`.
 
 Each lock is **non-blocking**: if another run already holds it, this run logs
 `… another run holds <lock>; skipping …` and skips only that stage (the two locks
@@ -160,6 +217,52 @@ Each run writes a timestamped session log `logs/autoupdateS1_<YYYY-MM-DDThhmmss>
 in the project directory (override the location with the `logDir` config key). It
 records the session header, orbit files downloaded, the search command, each SLC
 downloaded and reduced, and any errors (with traceback on an unexpected failure).
+
+The full log runs to thousands of lines on a normal night, so two companion
+files are written beside it:
+
+- **`<log>.summary`** — the whole session on one screen: counts downloaded,
+  already-in-archive, failed, filed, and the frame-check queue totals, plus
+  elapsed time. Always written, including after a crash (the summary matters
+  most when the run did not finish). This is the file to read each morning.
+- **`<log>.failures`** — written **only** when granules are still missing after
+  every retry. Bare URLs, one per line, nothing else, so it can be handed
+  straight back to the downloader:
+
+  ```
+  ariaDownload logs/autoupdateS1_2026-08-13T230004.failures
+  ```
+
+## Email notification
+
+**Opt-in.** With no `notifyEmail` key in `autoupdate.yaml`, nothing is ever mailed.
+Set `notifyEmail: you@example.com` and the summary is mailed to that address when
+any of these happen:
+
+- a granule is still missing after `maxAttempts` **and** the end-of-run retry pass;
+- **a unit landed in the `problem` queue** and has not been reported yet;
+- the session crashes outright.
+
+A clean run sends nothing, and `--check` never mails. (Same contract as
+`nisargrimpworkflow.autoupdate.notifyOnErrors`.)
+
+Several triggers still produce **exactly one** email — the subject names each
+one, e.g. `3 download(s) failed, 2 new problem unit(s) on helheim`.
+
+Problem units are collected by scanning `problem.yaml` for records without a
+`notified` flag, not from this run's own results, so units routed there by
+`setupTrack --queue` since the last run are picked up too. The flag is set
+**only after the send succeeds**: a failed send costs a duplicate next run,
+whereas marking early would lose the notice for good. Because the flag is only
+written when mail is actually configured and sent, enabling `notifyEmail` on a
+project that has been accumulating problems delivers one backlog email (capped
+at 50 units in the body).
+
+Do **not** use `root` as the recipient without checking `/etc/aliases` first — on
+the GrIMP workstation `root:` fans out to several people.
+
+Delivery is best effort via the local MTA (`mail`, then `mailx`): a machine with
+no working mailer logs a warning rather than failing the run.
 
 ## Debugging while catching up
 
