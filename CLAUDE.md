@@ -13,6 +13,7 @@ Search the ASF DAAC for NISAR / Sentinel-1 products, dedupe against a local arch
 | `refreshS1Orbits` | `refreshOrbits.py:main()` | Refresh the precise-orbit (EOF) archive from ASF `aux_poeorb` |
 | `fileS1` | `fileS1.py:main()` | Unpack S1 SAFE zips into the `assemblyDir` `track-<n>/<orbit>/` tree |
 | `checkFramesS1` | `checkFramesS1.py:main()` | Vet filed datatakes (burst "frames"), restructure, and queue → toProcess/pending/problem |
+| `downloadNISARoptimized` | `downloadNISARoptimized.py:main()` | Fetch NISAR products keeping only the datasets the GrIMP tools read, as float16, with a shared RTC factor |
 | `writeSearchGpkg` | `writeSearchGpkg.py` | Library only (no CLI) — used by `searchASF --gpkg` |
 
 ## Workflow
@@ -107,11 +108,19 @@ Stages in `runUpdate()` (each is skippable/isolatable):
 1. **Orbits** — `refreshOrbits.updateStateVectors` (skip `--noOrbits`).
 2. **Search** — `searchGranules` → `searchASF` (results to `archiveDir/searchResults/`).
 3. **Download** — serial `downloadOne`/`ariaDownload`, soft `--maxDownloads` cap finishing the in-progress pass; parallel cross-pol `reduceSentinel1` in a thread. Files zips to `archiveDir/<YYYY>-<MM>/`; `.zip.1` marks already-processed. Granules exhausting `maxAttempts` are collected in `failedUrls` and given one **retry pass after the main loop** (outages usually clear over a long run); the `--maxDownloads` cap is not reapplied there and recoveries decrement `nFailed`. `--noDownload` stops after orbits.
+   - **Duplicate products**: ASF sometimes serves an acquisition reprocessed — same platform/start/stop/orbit/datatake, new product id — which `granuleInArchive` does not catch because it keys on the full stem. Taking both breaks the assembly: `runPreProcTops` makes one `SLC_tab` per scene time, so the orbit reaches `trimTopsSLCsToFit` with 28 SAFEs against 14 tabs and fails (track-112/8260, S1C 2026-06-25, processed 06-25 and again 06-26). Handled at three points, by how far the held copy has got:
+     - **Both offered in one search** — `searchASF._drop_superseded_s1` keeps the newer by `processingDate` and the pair is never fetched. Scoped by `_s1_scene_key`, which returns `None` for anything that is not Sentinel-1, so NISAR passes through untouched.
+     - **NISAR equivalent** — `searchASF._drop_superseded_nisar` collapses search results (public + EA, after the stem dedupe) that share `_nisar_parse`'s scene key, keeping the highest CRID and then the highest product counter (`_001` vs a reprocessed `_002`). Added 2026-09-23 after a PIG GCOV cycle returned 11 such pairs, which geomosaic would otherwise have mosaicked twice. Unrecognised names pass through untouched.
+     - **A copy is held but its unit is not yet processed** (`duplicateDisposition` → `DUP_REPLACE`) — the new product is downloaded, then `retireDuplicate` removes the superseded `.SAFE` from the unit and **moves** its zip to `archiveDir/old/` (moved, not deleted: it stays recoverable and `granuleInArchive` keeps returning true, so the retired name is never re-fetched). Retiring happens **after** the download succeeds and **before** `startReduce`, so a failed download never leaves the acquisition with no copy and the unit never holds both. A stale `Failed` marker is cleared, since it describes contents that no longer exist and would otherwise pin the unit in `problem` for ever.
+     - **A copy is held and its unit is already processed** (`DUP_NOTE`) — nothing is downloaded or removed; a record goes to `notes.yaml` and the pair is named in the summary and **mailed**. Swapping it in would mean reprocessing, which is a decision with a cost attached.
+   - **Duplicates that landed before the check existed** (`noteFiledDuplicates`, after `fileStage`): a processed unit is never re-assembled, so a unit already holding both copies stays latent until someone reprocesses it — and then fails two stages from the cause. Driven from the archive's month dirs (a readdir apiece) rather than by walking the assembly tree, then only the few duplicated scenes are looked up in it. Writes one `notes.yaml` record per affected unit. As of 2026-08-28: 37 of 14471 archived acquisitions, in 3 units (track-1/4547, track-141/4512, track-171/4542), all already processed.
    - **Concurrent filing** (default on; `--noFileDuringDownload` disables): `_reduceWorker` calls `pipeline.submit()` on the statement *after* `remove_files_from_zip` returns, so a zip is never unzipped while `zip -d` rewrites it in place. `_FilingPipeline` is a `queue.Queue` + `fileWorkers` (default 2) non-daemon threads calling `fileS1.fileOneZip`. `downloadStage` joins the reduce threads **then** drains the pipeline, in a `finally` — join order is the correctness condition, and skipping it would hang exit on the non-daemon workers.
 4. **File** — `fileStage` → `fileS1` (only if `assemblyDir` in config).
 5. **Frame check** — `frameCheckStage` → `checkFramesS1` (only if `assemblyDir` in config).
-6. **Assemble** — `assembleStage` → `setupTrack --queue` **as a subprocess** (only if `assemble: true`). Subprocess, not import: `s1setup` already depends on this package for `queueS1`, so importing setupTrack would make it circular. Passes `--lockHeld` because runUpdate is already holding the assembly lock. This stage is the disk-control mechanism — a filed-but-unassembled unit holds ~30 GB of measurement TIFFs (~1.1 TB/night at ~37 units), and assembling strips them.
+6. **Assemble** — `assembleStage` → `setupTrack --queue` **as a subprocess** (only if `assemble: true`). Needs the **Gamma environment**, which cron does not have: `setupTrack` shells out to `S1_TOPS_preproc`, `SLC_cat_S1_TOPS`, `SLC_copy_S1_TOPS`, `S1_OPOD_vec` and `setuptopsimage` by bare name, and those come from `~/.cshrc`. `scripts/runAutoupdateS1.sh` therefore sources `scripts/gammaEnv.sh` after `conda activate base` — appended to `PATH`, so conda's bin stays ahead and the console scripts keep resolving to the conda python. Without it every unit dies in ~9 s with `FileNotFoundError: 'S1_TOPS_preproc'` (64 units, 2026-08-16, the first cron ever to reach this stage). `gammaEnv.sh` is a hand copy of the csh definitions — bash cannot source `.cshrc` — so it carries a drift warning. Subprocess, not import: `s1setup` already depends on this package for `queueS1`, so importing setupTrack would make it circular. Passes `--lockHeld` because runUpdate is already holding the assembly lock. This stage is the disk-control mechanism — a filed-but-unassembled unit holds ~30 GB of measurement TIFFs (~1.1 TB/night at ~37 units), and assembling strips them.
 7. **Free-space check** — `checkFreeSpace` records free space on the `assemblyDir` volume and sets `summary.lowDisk` when below `minFreeTB` (default 6), which is a third mail trigger.
+
+- **`sweepProblems` must run after every stage that can route a unit to `problem`** — currently the frame check (stage 5) and the assemble (stage 6), plus both isolation paths (`--checkFrames`, `--assembleOnly`). It reads `unnotified()` from the queue file, not this run's own entries, so it also picks up whatever `setupTrack` filed since the last run. The 2026-08-16 cron is why: the sweep lived only at the end of `frameCheckStage`, which runs *before* the assemble, so when all 64 units failed to assemble the summary recorded `problem 0`, no mail went out, and a completely failed assembly was silent. `addProblems` dedupes by `unit`, so the two sweeps in one run list a unit once.
 
 - **Config keys**: `archiveDir` (required), `assemblyDir` (enables stages 4–5), `orbitDir`, `queueDir` (default `assemblyDir`), `region`/`searchArea`, `satellites`, `productType`, `beamMode`, `direction`, `firstDate`/`lastDate`, `maxDownloads`, `reducePattern`, `maxAttempts`, `logDir`, `fileWorkers` (default 2), `notifyEmail` (**opt-in, no default** — with no key nothing is mailed, matching `nisargrimpworkflow.autoupdate.notifyOnErrors`; do not default it to `root`, `/etc/aliases` fans root out to several people).
 - **Isolation flags**: `--fileData` (run only stage 4), `--checkFrames` (run only stage 5), `--noOrbits`, `--noDownload`, `--noFileDuringDownload`.
@@ -150,6 +159,78 @@ The queue-file contract, shared with `s1setup.setupTrack`. **Imports nothing hea
 - **Over-length**: split only when the **frameRange-clamped** in-range span > 127 (`rangeSpan`, *not* raw extent — this is the fix for spurious splits); first *n* SAFEs → `<orbit>_4`, *n* derived deterministically from `frameRange` (not read from existing, inconsistently-numbered splits). New `_N` dirs are seeded with the bare orbit's `ascendingNodeTime` cache.
 
 Each resulting unit routes to a **cumulative, idempotent** YAML queue in `queueDir` — `toProcess` (EOF orbit ready) / `pendingProcessing` (`no orbit` yet — POEORB lands ~3 wk out) / `problem` (unresolved). Records carry `unit, orbit, date, startFrame, endFrame, totalFrames`. At startup, `promotePending` re-checks pending units and moves any whose orbit arrived → `toProcess` (full-rewrite queues). Fully-processed units (`Completed` marker or `{orbit}-{seq}` output dir, per `setupTrack`) show `-> processed` and are never restructured/re-queued. `--check` prints one date-ordered line per orbit with the day-gap (`+Nd`, rounded) and changes nothing. Positional `track` (`track-16` / `16`) scopes to one track; omit for all. Orbit availability via `refreshOrbits.orbitFileReady` (EOF validity window covers the acquisition).
+
+## checkExcludeFrames / per-track frame exclusions
+
+A region-wide search area clips in frames just outside an individual track's `frameRange`; `checkFramesS1` then bins them to `track-N/tmp` every cycle (368 SAFEs / **1.07 TB** across 7 Greenland tracks by 2026-08). Fixed *per track*, never by editing the shared region outline.
+
+`<assemblyDir>/track-N/excludeFrames` holds **ASF/ESA frame numbers** — *not* the burst numbers in `frameRange` (track-90: ASF frames 194…264 for a `frameRange` of `360 486`). It sits beside `frameRange` so widening one prompts a re-check of the other. `autoupdateS1.excludedFramesSpec()` gathers them into `searchASF --excludeFrames "90:191 141:317,323"`, enforced in the same filter as `--excludeTracks` and counted separately (`Excluded frames 90:191: 8`).
+
+`checkExcludeFrames --assemblyDir ... --gpkgDir ...` validates: per listed frame, `CLASH` if that track's real units use it (exit 1), otherwise how many binned SAFEs it accounts for. Frame numbers are resolvable only from the retained search gpkgs, so granules older than all of them are reported unmatched, never assumed safe. See `Documents/excludeFrames.md`; track-141 frame 378 is deliberately excluded from the list (in range on some datatakes, not others).
+
+## downloadNISARoptimized
+
+Replaces the whole-product `aria2c` fetch for NISAR GCOV (and the ad-hoc
+`Antarctica-GCOV/gcovDownload.sh`). A GCOV is ~3 GB with ~280 datasets; `geomosaic` reads five,
+and `numberOfLooks` alone is 26% of the file. This fetches only the byte ranges the kept
+datasets occupy, writes a slim HDF5 with the **same internal paths** (so `geomosaic` reads it
+unchanged), converts the two big float bands to float16, and stores `rtcGammaToSigmaFactor` once
+per track/frame/grid.
+
+Measured on one Antarctic granule (3.06 GB archive product, 19 MB/s cap):
+
+| | download | stored |
+|---|---|---|
+| archive product | 3.06 GB / 172 s | 3.06 GB |
+| first cycle (fetches the factor) | 1.96 GB / 103 s | 681 MB + 250 MB factor = **3.3x** |
+| later cycles (factor reused) | 1.13 GB / 60 s | 681 MB = **4.5x** |
+
+Verified: the slim product mosaics to the **same valid-pixel count** with max 0.01 dB difference
+(one Int16 DN, the float16 quantisation), and `nisarhdf` still opens it.
+
+### Things that are load bearing and look like details
+
+- **Per-request latency to ASF is a flat ~2 s regardless of size** (0.25 MB 2.04 s, 16 MB 2.92 s),
+  so cost is `requests x 2 s`. Reading the wanted chunks one at a time is ~6.8 h per granule; they
+  must be coalesced into large runs (~180 runs, 16 connections).
+- **Planning needs `cache_type='blockcache'`.** fsspec's default single-buffer cache re-fetches as
+  the chunk index is walked out of order: 259 s versus 16 s.
+- **The presigned URL must come from a GET redirect, followed to the end.** The chain is
+  ASF → Earthdata OAuth → ASF → CloudFront, so the first `Location` is the login page; and a
+  HEAD-signed CloudFront URL 403s on every subsequent range request.
+- **Blacklist, not whitelist.** Everything outside the three big rasters is 4.2 MB of a 5.1 GB
+  granule (0.08%). Keeping it retires: the scalar `projection` datasets whose *attributes* carry
+  the EPSG (dropping the radarGrid one fails **silently**, leaving psi at zero),
+  `identification/boundingPolygon` which `mosaicworkflow.addGCOVShapes` reads, and
+  `listOfCovarianceTerms`/`processingInformation`/`sourceData` without which `nisarhdf` cannot
+  open the file at all.
+- **Split by STORAGE, not size.** Chunked datasets go by byte range; everything else is read
+  during planning and carried in memory. A variable-length dataset stores only pointers at its own
+  offset while the strings live in a **global heap collection** elsewhere — range-fetching one
+  yields `bad global heap collection signature`.
+- **Strip `DIMENSION_LIST`/`REFERENCE_LIST`/`CLASS`/`NAME` and re-attach.** The source
+  `REFERENCE_LIST` names five rasters; a slim product holds two, so copying it verbatim leaves
+  pointers to datasets that are gone or now sit at a different address.
+- **The factor key excludes cycle and start time** (that is what it spans) but includes track,
+  direction, frame, mode and the A/M flag, plus a hash of `(nx, ny, x0, y0, dx, dy, epsg)`. 173 of
+  657 cycle-030 granules are partial frames, so a position that is partial in one cycle and full
+  in the next has a different grid; reusing a factor there would silently misregister the
+  gamma→sigma conversion. `geomosaic` re-checks the raster size at read time as well.
+- **`claimed` guards the pipeline race.** Repack of granule N overlaps the fetch of N+1, so two
+  granules of the same position back to back would both see no factor on disk and both pay
+  ~0.83 GB to fetch it.
+
+### How geomosaic finds the shared factor
+
+The tool leaves a **symlink per granule** in `--factorDir`, named exactly like the granule,
+pointing at the shared file. The GCOV yaml gets `factorFrom: <factorDir>` and `openGCOV` opens
+`<factorDir>/<granule basename>` — so the C never derives the sharing key.
+
+An HDF5 **virtual dataset** would need no C change and is free on GDAL 3.9/HDF5 1.14.3
+(0.31 s vs 0.30 s), but takes **213.78 s instead of 0.07 s on GDAL 3.11.5/HDF5 2.2.0** — a ~3000x
+regression, and it fails *silently* when the source is missing (HDF5 returns the fill value, which
+`geomosaic` drops, so the granule contributes nothing and feathering hides it). Do not switch to
+one. See `mosaicSource/CLAUDE.md`.
 
 ## Notes
 
