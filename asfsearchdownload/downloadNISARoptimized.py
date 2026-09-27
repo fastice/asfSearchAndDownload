@@ -29,6 +29,7 @@ Three things here are load bearing and look like details:
 """
 import argparse
 import asyncio
+import glob
 import hashlib
 import json
 import os
@@ -141,6 +142,10 @@ def downloadNISARoptimizedArgs():
                         help='stop after this many, 0 for all [0]')
     parser.add_argument('--check', action='store_true',
                         help='report what would be fetched and exit')
+    parser.add_argument('--local', action='store_true',
+                        help='treat --urls as LOCAL granule paths and convert them in place of '
+                             'downloading. Originals are never touched, so --outputDir must '
+                             'differ from where they live.')
     return parser.parse_args()
 
 
@@ -539,6 +544,15 @@ def fetchOne(url, args, desc, session, claimed):
     sparse = os.path.join(args.tmpDir, stem + '.sparse')
     if os.path.exists(sparse):
         os.remove(sparse)
+    # MUST be the full product size. HDF5 records the expected EOF in the superblock, so a
+    # file shorter than that is refused as truncated ("stored_eof = ..."). Sizing it to the
+    # fetched span instead was tried and broke every repack.
+    #
+    # This costs nothing: the file is sparse, and tmpfs charges only written pages - 176 GB of
+    # apparent scratch held 2.1 GB real. The ENOSPC that killed 43 granules was NOT the sizing
+    # but LEAKED scratch files: a SIGKILL skips the finally that removes them, and each one
+    # retains its written pages, so a few interrupted runs pinned ~135 GB. The sweep at startup
+    # is the actual fix.
     os.truncate(os.open(sparse, os.O_WRONLY | os.O_CREAT), size)
     t0 = time.time()
     got = asyncio.run(fetchRuns(signed, runs, sparse, args.connections,
@@ -552,6 +566,55 @@ def fetchOne(url, args, desc, session, claimed):
                 factorTarget=os.path.basename(factorPath) if shareFactor else None,
                 chunked=chunked, small=small, groups=groups,
                 gridKey=key, gridSig=sig, shareFactor=shareFactor)
+
+
+def convertOne(path, args, desc, claimed):
+    """Convert a local granule to a slim product. No network.
+
+    Same repack as the fetch path, so the two cannot drift: the only difference is that the
+    datasets are read from the granule on disk instead of from a sparse file assembled out of
+    range requests. Originals are left alone - the caller checks outputDir is elsewhere - so a
+    conversion can be verified before anything is deleted.
+    """
+    stem = granuleStem(path)
+    if trackFrameKey(stem) is None:
+        return None
+    outPath = os.path.join(args.outputDir, stem + '.h5')
+    if os.path.exists(outPath):
+        return None
+    grid = desc['grid'].format(f=args.frequency)
+    with h5py.File(path, 'r') as h:
+        pol = f'{grid}/{args.polarization}'
+        if pol not in h:
+            print(f'  skipping {stem[-34:]}: no {args.polarization}', flush=True)
+            return None
+        if h[pol].dtype == np.float16:
+            print(f'  skipping {stem[-34:]}: already float16', flush=True)
+            return None
+        shareFactor = not args.noShareFactor
+        chunked, small, groups = keptDatasets(h, desc, args.polarization, args.frequency,
+                                              shareFactor)
+        key, sig = gridKey(h, grid)
+    tf = trackFrameKey(stem)
+    factorPath = None
+    if shareFactor:
+        factorPath = os.path.join(
+            args.factorDir,
+            'rtcFactor_{}_{}_{}_{}_{}_{}.h5'.format(tf[0], tf[1], tf[2], tf[3], tf[4], key))
+    needFactor = (shareFactor and not os.path.exists(factorPath)
+                  and factorPath not in claimed)
+    if needFactor:
+        claimed.add(factorPath)
+        chunked = chunked + [(f'{grid}/{desc["shared"]}', True)]
+    elif not shareFactor:
+        chunked = chunked + [(f'{grid}/{desc["shared"]}', True)]
+    return dict(stem=stem, sparse=path, outPath=outPath,
+                factorPath=factorPath if needFactor else None,
+                linkPath=(os.path.join(args.factorDir, stem + '.h5')
+                          if shareFactor else None),
+                factorTarget=os.path.basename(factorPath) if shareFactor else None,
+                chunked=chunked, small=small, groups=groups,
+                gridKey=key, gridSig=sig, shareFactor=shareFactor, keepSource=True)
 
 
 def repackOne(job, args, desc):
@@ -580,7 +643,9 @@ def repackOne(job, args, desc):
                 os.remove(p)
         return job['stem'], 0, [f'repack failed: {e}'], 0
     finally:
-        if os.path.exists(job['sparse']):
+        # keepSource marks a local conversion, where 'sparse' is the ORIGINAL granule. Only a
+        # fetched sparse scratch file is ever removed.
+        if not job.get('keepSource') and os.path.exists(job['sparse']):
             os.remove(job['sparse'])
 
 
@@ -591,7 +656,35 @@ def main():
         args.factorDir = os.path.join(args.outputDir, 'factors')
     os.makedirs(args.outputDir, exist_ok=True)
     os.makedirs(args.factorDir, exist_ok=True)
+    # Sweep leaked scratch files. A SIGKILL skips the finally that removes them, so every
+    # interrupted run leaves one behind; they accumulated until tmpDir was full.
+    if not args.local:
+        leaked = glob.glob(os.path.join(args.tmpDir, 'NISAR_*.sparse'))
+        alive = {os.path.join(args.tmpDir, granuleStem(u) + '.sparse') for u in
+                 [x.strip() for x in open(args.urls) if x.strip()]}
+        stale = [f for f in leaked if f in alive or True]
+        for f in stale:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        if stale:
+            print('removed %d leaked scratch file(s) from %s' % (len(stale), args.tmpDir),
+                  flush=True)
+        free = os.statvfs(args.tmpDir)
+        freeGb = free.f_bavail * free.f_frsize / 1e9
+        print('%s has %.1f GB free' % (args.tmpDir, freeGb), flush=True)
+        if freeGb < 20:
+            myerror('downloadNISARoptimized: only %.1f GB free in %s - the scratch files need '
+                    'room; point --tmpDir somewhere larger' % (freeGb, args.tmpDir))
     urls = [u.strip() for u in open(args.urls) if u.strip()]
+    if args.local:
+        bad = [u for u in urls
+               if os.path.realpath(os.path.dirname(u)) == os.path.realpath(args.outputDir)]
+        if bad:
+            myerror('downloadNISARoptimized --local: outputDir is where the originals live, '
+                    'which would overwrite them (%d of %d). Point it elsewhere.'
+                    % (len(bad), len(urls)))
     if args.maxGranules:
         urls = urls[:args.maxGranules]
     print('{} granules, output {}, factors {}, {}'.format(
@@ -607,7 +700,8 @@ def main():
         pending, claimed = [], set()
         for url in urls:
             try:
-                job = fetchOne(url, args, desc, session, claimed)
+                job = (convertOne(url, args, desc, claimed) if args.local
+                       else fetchOne(url, args, desc, session, claimed))
             except Exception as e:
                 print(f'  FAILED {granuleStem(url)}: {e}', flush=True)
                 nFail += 1
