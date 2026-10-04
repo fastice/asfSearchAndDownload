@@ -466,17 +466,30 @@ def promoteProblem(queues, newEntries, deltas, assemblyDir, orbitDir, check):
 # --------------------------------------------------------------------------- #
 # core
 # --------------------------------------------------------------------------- #
+def trackNumber(trackDir):
+    '''
+    Track number from a track-<n> directory path, or None if it is not one.
+    '''
+    name = os.path.basename(str(trackDir).rstrip('/'))
+    number = name[len('track-'):] if name.startswith('track-') else ''
+    return int(number) if number.isdigit() else None
+
+
 def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
                 lastDate=None, queueDir=None, check=False, noSplit=False,
-                noBreakGap=False, noMoveOutOfRange=False):
+                noBreakGap=False, noMoveOutOfRange=False, excludeTracks=None):
     ''' Vet in-range datatakes under assemblyDir, restructure each into clean
     processing units, and route each into the cumulative toProcess /
     pendingProcessing / problem queues. Returns the new entries per queue.
 
     assemblyDir holds the track-<n>/ dirs and is where the queues live. If track
     (e.g. 'track-16' or '16') is given, only that track is scanned; otherwise
-    every track-<n>/ under assemblyDir is. '''
+    every track-<n>/ under assemblyDir is.
+
+    excludeTracks are never scanned, so nothing of theirs reaches a queue. An
+    explicit track wins: asking for one by name overrides the exclusion. '''
     assemblyDir = os.path.abspath(assemblyDir)
+    excluded = set(excludeTracks or [])
     if track:
         name = os.path.basename(str(track).rstrip('/'))
         if not name.startswith('track-'):
@@ -486,8 +499,14 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
             u.myerror(f'checkFramesS1: no such track dir {trackDirs[0]}')
     else:
         trackDirs = sorted(glob.glob(os.path.join(assemblyDir, 'track-*')))
+        if excluded:
+            trackDirs = [d for d in trackDirs
+                         if trackNumber(d) not in excluded]
+            print('checkFramesS1: excluding tracks ' +
+                  ' '.join(str(t) for t in sorted(excluded)))
     orbitDir = orbitDir or refreshOrbits.DEFAULT_ORBIT_DIR
-    queueDir = os.path.abspath(queueDir or assemblyDir)
+    queueDir = queueS1.resolveQueueDir(assemblyDir, queueDir,
+                                       migrate=not check)
     if firstDate is None:
         firstDate = datetime.now() - timedelta(days=185)
     if lastDate is None:
@@ -675,6 +694,11 @@ def parseArgs():
                         help='Do not break datatakes with gaps into segments')
     parser.add_argument('--noMoveOutOfRange', action='store_true',
                         help='Do not move out-of-range SAFEs to tmp/')
+    parser.add_argument('--excludeTracks', type=str, default='',
+                        metavar='"N N ..."',
+                        help='Tracks never to scan, as one quoted space- or '
+                        'comma-separated value: --excludeTracks "114 143". '
+                        'Naming a track explicitly overrides this')
     return parser.parse_args()
 
 
@@ -688,7 +712,10 @@ def main():
                 firstDate=firstDate, lastDate=lastDate, queueDir=args.queueDir,
                 check=args.check, noSplit=args.noSplit,
                 noBreakGap=args.noBreakGap,
-                noMoveOutOfRange=args.noMoveOutOfRange)
+                noMoveOutOfRange=args.noMoveOutOfRange,
+                excludeTracks=[int(x) for x in
+                               args.excludeTracks.replace(',', ' ')
+                               .split()])
 
 
 if __name__ == '__main__':

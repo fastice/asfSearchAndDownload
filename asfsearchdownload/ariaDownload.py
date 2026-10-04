@@ -14,9 +14,14 @@ from datetime import datetime
 
 
 def myerror(message):
-    """ print error and exit """
+    """ print error and exit with a FAILING status (1).
+
+    Local copy of utilities.myerror; was a bare sys.exit() (status 0), which
+    made the subprocess.run(..., check=True) callers in autoupdate.py /
+    autoupdateS1.py treat a failed download as success.
+    """
     print(f'\n\t\033[1;31m *** {message} *** \033[0m\n')
-    sys.exit()
+    sys.exit(1)
 
 
 def ariaArgs():
@@ -36,6 +41,9 @@ def ariaArgs():
                         'use * for all /Volumes/insar*/ian/xfer')
     parser.add_argument('--noRename',  action='store_true', default=False,
                         help='Do not rename/move existing zip.1 file')
+    parser.add_argument('--connections', type=int, default=None,
+                        help='aria2c -x connections per server; overrides the '
+                        'time-of-day default [time of day]')
     #
     args = parser.parse_args()
     xferDirs = ['.']
@@ -45,7 +53,8 @@ def ariaArgs():
                 xferDirs.append(f'/Volumes/insar{n}/ian/xfer')
     else:
         xferDirs = [args.xferDir]
-    return args.downloadLinks[0], args.overWrite, xferDirs, not args.noRename
+    return (args.downloadLinks[0], args.overWrite, xferDirs,
+            not args.noRename, args.connections)
 
 
 def getX():
@@ -66,7 +75,7 @@ def getX():
 
 def main():
     ''' Download files with aria2c '''
-    downloadLinks, overwrite, xferDirs, rename = ariaArgs()
+    downloadLinks, overwrite, xferDirs, rename, connections = ariaArgs()
     if not os.path.exists(downloadLinks):
         myerror(f'{downloadLinks} files does not exist')
     # Now download list
@@ -97,7 +106,7 @@ def main():
             if os.path.exists(myFile) and not overwrite:
                 print(f'skipping existing {myFile}')
                 continue
-            x = getX()
+            x = getX() if connections is None else connections
             call(f'aria2c -x {x} {link.strip()}', shell=True, executable='/bin/csh')
 
 

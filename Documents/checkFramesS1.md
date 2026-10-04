@@ -39,8 +39,8 @@ split head.
 
 ## Queues
 
-Cumulative YAML lists written to `queueDir` (default = `assemblyDir`). Each entry
-is a record:
+Cumulative YAML lists written to `queueDir` (default = `assemblyDir/autoupdate`).
+Each entry is a record:
 
 ```yaml
 - unit: track-90/63162        # identity (relative to assemblyDir)

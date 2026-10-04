@@ -4,9 +4,14 @@
 #
 # cron runs with an almost-empty environment, so this wrapper activates the
 # conda env that provides autoupdateS1, searchASF, ariaDownload and reduces1
-# (plus aria2c / zip on the system PATH), then runs the update for one project
-# directory. It lives in the package so it is versioned with the code; reference
-# it from crontab by its absolute path.
+# (plus aria2c / zip on the system PATH), sources the Gamma environment the
+# assemble stage needs, then runs the update for one project directory. It lives
+# in the package so it is versioned with the code; reference it from crontab by
+# its absolute path.
+#
+# The Gamma part is not optional once `assemble: true` is set in autoupdate.yaml:
+# setupTrack shells out to S1_TOPS_preproc and friends by bare name, and those
+# come from ~/.cshrc, which cron never sources. See scripts/gammaEnv.sh.
 #
 # Usage (from cron, by absolute path):
 #   runAutoupdateS1.sh <projectDir> [extra autoupdateS1 args]
@@ -16,6 +21,7 @@
 #
 # Environment overrides (defaults suit the GrIMP workstation):
 #   CONDA_BASE  conda/miniforge install root [/home/ian/miniforge3]
+#   GAMMA_ROOT  Gamma install root [/home/ian/gammaISP/GAMMA_SOFTWARE-20160611]
 #
 # Note: no `set -u` here -- conda's own activate/deactivate hooks reference
 # unbound variables, so `set -u` would abort activation. The explicit guards
@@ -30,6 +36,18 @@ fi
 # shellcheck disable=SC1091
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate base
+
+#
+# After conda, so conda's bin stays ahead of the Gamma and GrIMP directories on
+# PATH and the console scripts keep resolving to the conda python
+#
+GAMMAENV="$(dirname "$(readlink -f "$0")")/gammaEnv.sh"
+if [ ! -f "$GAMMAENV" ]; then
+    echo "$(date): cannot find gammaEnv.sh beside $0" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "$GAMMAENV" || exit 1
 
 PROJ="${1:-}"
 if [ -z "$PROJ" ]; then

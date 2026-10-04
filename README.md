@@ -19,6 +19,8 @@ pip install git+https://github.com/fastice/asfSearchAndDownload.git@main
 - [ariaDownload](Documents/ariaDownload.md) — download from URL list via aria2c with time-of-day throttling
 - [reduces1](Documents/reduceSentinel1.md) — remove files from Sentinel-1 ZIP archives by pattern
 - [searchASF](Documents/searchASF.md) — search ASF DAAC for NISAR and Sentinel-1 products
+- [pullASF](Documents/pullASF.md) — fetch a pair's granules into the archive (download + reduce), one download at a time across all hosts
+- [excludeFrames](Documents/excludeFrames.md) — per-track frame exclusions, so a region-wide search area stops pulling frames a track only bins
 
 ## For Further Information
 

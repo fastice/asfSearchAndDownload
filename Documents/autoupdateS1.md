@@ -58,6 +58,7 @@ A pass already present anywhere under `archiveDir/<YYYY>-<MM>/` as `.zip` or
    restructures it into clean processing units (`<orbit>_4` split head, `<orbit>_1+`
    far-side gap segments, out-of-range → `tmp/`), and routes each unit into the
    cumulative `toProcess` / `pendingProcessing` / `problem` queues under `queueDir`
+   (by default `assemblyDir/autoupdate`, see Queue directory below)
    (default `assemblyDir`). Each queued record carries the orbit, date, and in-range
    start/end/total frames. A datatake whose precise (EOF) orbit isn't published yet
    goes to `pendingProcessing`; at the start of each run those are re-checked and
@@ -144,8 +145,9 @@ orbit archive.
 archiveDir: /Volumes/insar4/ian/Data/S1-Greenland          # required
 assemblyDir: /Volumes/insar1/ian/S1-Greenland/data          # file stage target tree
 orbitDir:   /Volumes/insar9/ian/Data/SentinelGreenland/OPOD # EOF archive
-# queueDir:  /Volumes/insar1/ian/S1-Greenland/data          # frame-check queues [default: assemblyDir]
+# queueDir:  /Volumes/insar1/ian/S1-Greenland/data          # frame-check queues [default: assemblyDir/autoupdate]
 region:     Greenland      # or: Antarctica  (or use searchArea instead)
+# tracksToExclude: 114 143 155   # never downloaded, filed or queued [none]
 satellites: S1A S1B S1C S1D  # which sensors [all four]
 productType: SLC           # searchASF --products [SLC]
 beamMode:   IW             # searchASF --beamMode [IW]
@@ -172,6 +174,82 @@ descending is passed through to `searchASF --flightDirection`. `assemblyDir` is
 required for the file stage (`--fileData`, and the automatic step 4); if it is
 absent the normal run logs `no assemblyDir in config; skipping file stage` and
 finishes after download — so existing configs keep working unchanged.
+
+## Managing the queues (queueS1)
+
+**Use `queueS1`, not a text editor.** It takes the queue lock and writes
+atomically; an editor does neither, so a write landing between another host's
+read and write silently loses entries. Run it from the assembly directory,
+which is where it finds `autoupdate/`:
+
+```
+queueS1 info                        # paths, config, lock states, counts
+queueS1 list [problem]              # entries, with their comments
+queueS1 remove track-89/64236       # drop from whichever queue holds it
+queueS1 promote track-89/64236      # problem -> toProcess, after a manual fix
+```
+
+`remove` and `promote` refuse the whole call if any unit is not in a queue, so
+a typo cannot look like success, and they report when the lock is busy rather
+than failing quietly.
+
+Usually you do not need them at all: `checkFramesS1` re-evaluates every problem
+entry on each run (`promoteProblem`) and clears the ones that now pass, so a
+unit fixed by hand returns to `toProcess` by itself on the next
+`autoupdateS1 --checkFrames`.
+
+`autoupdate/configPath` records which `autoupdate.yaml` drives the queue
+directory -- the config sits beside the archive and the queues beside the
+assembly tree, often on different volumes, and nothing else connects them.
+
+## Checking state (--info)
+
+```
+autoupdateS1 --info [config]
+```
+
+Prints the config, archive, assembly, orbit, log and queue paths, the excluded
+tracks, whether assembly is enabled, both lock states, and the queue counts
+(to process, pending, problem, completed, processed today). It reads only and
+takes no lock, so it answers while a run is in progress -- which is when it is
+most wanted.
+
+## Queue directory
+
+The queue state and the locks live together in `<assemblyDir>/autoupdate/`:
+
+```
+toProcess.yaml  pendingProcessing.yaml  problem.yaml   the three queues
+completed.yaml  processed.<YYYY-MM-DD>.yaml            the processed record
+notes.yaml                                             things to look at
+.queueS1.lock   .assemblyTree.lock                     the locks
+```
+
+`notes.yaml` holds what no queue owns: a run made a choice worth recording, but
+nothing is broken and nothing is waiting on it — a reprocessed product left
+untaken because its unit is already processed, or a unit found holding two
+products of one acquisition. These do not belong in `problem.yaml`, which is a
+work queue: an entry no run can clear would leave it permanently non-empty and
+train you to ignore it. Records are keyed on `(subject, comment)` and appended
+only if new, so a standing condition is recorded once rather than every night.
+
+They used to sit loose at the top of the assembly tree, among the track
+directories and whatever ad-hoc scripts and scratch had accumulated there. The
+directory is created on first use and any files of the old layout are moved
+into it, once; `queueDir` in the config still overrides the location and is
+never migrated.
+
+Two things the migration will not do. It skips while either lock is present,
+because something is running -- moving `.assemblyTree.lock` out from under its
+holder would leave the next host seeing no lock and writing the same tree. And
+it does nothing under `--check`, which must not touch the filesystem; a dry run
+reports the location the queues are in now, not the one they will move to.
+
+Every tool resolves the directory the same way, through
+`queueS1.resolveQueueDir` -- `checkFramesS1`, `autoupdateS1`, and `setupTrack`
+in the s1setup package. That shared resolution is what matters for the locks:
+one caller locking the assembly top while another locked the queue directory
+would not exclude each other at all.
 
 ## Locking (multi-machine safe)
 
@@ -241,6 +319,7 @@ any of these happen:
 
 - a granule is still missing after `maxAttempts` **and** the end-of-run retry pass;
 - **a unit landed in the `problem` queue** and has not been reported yet;
+- **a duplicate product was skipped** (see below);
 - the session crashes outright.
 
 A clean run sends nothing, and `--check` never mails. (Same contract as
@@ -263,6 +342,79 @@ the GrIMP workstation `root:` fans out to several people.
 
 Delivery is best effort via the local MTA (`mail`, then `mailx`): a machine with
 no working mailer logs a warning rather than failing the run.
+
+## Duplicate products
+
+ASF occasionally serves an acquisition **reprocessed**: same platform, same start
+and stop to the microsecond, same absolute orbit and datatake, and a new product
+id at the end of the granule name. The search treats it as a new granule, because
+the name differs.
+
+Taking both is what does the damage. `runPreProcTops` builds one `SLC_tab` per
+scene time, so an orbit holding two copies of every scene arrives at
+`trimTopsSLCsToFit` with twice as many SAFEs as tabs and fails outright:
+
+```
+*** mismatch: 14 SLC_tabs, 28 SAFEs
+FAILED: trimTopsSLCsToFit returned exit code 1
+```
+
+That is track-112 orbit 8260 (S1C, 2026-06-25), whose 14 scenes were processed
+on 06-25 and again on 06-26 and downloaded on consecutive nights.
+
+Granules are therefore compared on their **scene key** — everything up to and
+including the datatake, i.e. the whole name but the product id. What happens
+then depends on how far the copy already held has got, because that is what
+decides whether taking the newer product costs anything.
+
+**Both offered in the same search.** `searchASF` keeps the one with the later
+`processingDate` and drops the other before anything is fetched, reporting
+`superseded: <name>` / `keeping: <name>`. Sentinel-1 only: the scene key returns
+nothing for other collections, so NISAR searches are unaffected.
+
+**A copy is held, its unit not yet assembled.** The reprocessed product is what
+ASF intended you to have and nothing downstream has read the old one, so the new
+one is downloaded and the old is retired: its `.SAFE` is removed from the unit
+directory and its zip is **moved to `archiveDir/old/`**. Moved rather than
+deleted, so the old product stays recoverable and still counts as held — which
+is what stops it being downloaded again on a later pass. The retirement happens
+only **after** the replacement has downloaded (a failed download must not leave
+the acquisition with no copy at all) and before the zip is filed, so the unit
+never holds both. Any `Failed` marker left in the unit is cleared: it describes
+contents that no longer exist, and while it stands `promoteProblem` will not
+re-route the unit, so the repair would never reach assembly.
+
+**A copy is held and its unit is already processed.** Nothing is downloaded and
+nothing is removed. Swapping the product in would mean reprocessing the unit,
+which has a real cost and is a decision for a person. The pair is recorded in
+`notes.yaml` and named in the summary and **mailed**.
+
+### Duplicates already on disk
+
+The rules above catch a duplicate as it arrives. Ones that landed earlier are
+found by `noteFiledDuplicates`, which runs after the filing stage. It matters
+because a processed unit is never re-assembled: a unit holding both copies is
+not failing now and will not fail until someone reprocesses it, at which point
+it breaks two stages away from the cause.
+
+It works from the archive's month directories — which name every acquisition
+held, so spotting the few with two products costs a readdir apiece — and only
+then looks those few up in the assembly tree. A full pass over the Greenland
+archive is about a tenth of a second. One `notes.yaml` record is written per
+affected unit, deduped, so a standing condition does not add a line a night.
+
+```
+1 granule(s) not downloaded: ASF holds another product of the same acquisition
+  (same platform, start, stop, orbit and datatake; a different product id)
+  the copy already in the archive was kept and nothing was removed:
+  not fetched : S1C_..._008260_01054F_DC7D.zip
+  already had : S1C_..._008260_01054F_96E9.zip.1
+```
+
+An orbit that already holds both copies is **not** cleaned up by this: it stays
+broken until one is removed by hand, and the retry keeps failing at the same
+place. This is expected to be rare; if it turns out not to be, the handling is
+worth revisiting.
 
 ## Debugging while catching up
 

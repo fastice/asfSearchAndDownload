@@ -38,6 +38,7 @@ import contextlib
 import datetime
 import glob
 import os
+import shutil
 import socket
 import time
 
@@ -156,13 +157,79 @@ def assemblyLock(assemblyDir, wait=0, staleSeconds=ASSEMBLY_STALE_SECONDS):
     Guard every writer of the assembly tree: checkFramesS1 moves SAFE dirs while
     restructuring, and setupTrack reads them for minutes at a time.
 
-    Lives beside the tree (not in a project dir) so any tool given --assemblyDir
-    can take it. Same O_EXCL pattern as queueLock but non-blocking by default and
-    with a long stale window, since a legitimate assembly run lasts hours.
+    Lives beside the queues under <assemblyDir>/autoupdate (not in a project
+    dir) so any tool given --assemblyDir takes the same one. Resolving through
+    resolveQueueDir is what keeps that true: a caller locking the assembly top
+    while another locks the queue directory would not exclude each other at
+    all. Same O_EXCL pattern as queueLock but non-blocking by default and with
+    a long stale window, since a legitimate assembly run lasts hours.
     '''
-    with queueLock(assemblyDir, wait=wait, staleSeconds=staleSeconds,
+    with queueLock(resolveQueueDir(assemblyDir), wait=wait,
+                   staleSeconds=staleSeconds,
                    name=ASSEMBLY_LOCK_NAME) as acquired:
         yield acquired
+
+
+QUEUE_DIR_NAME = 'autoupdate'
+
+
+def legacyQueueFiles(directory):
+    '''
+    Queue and lock files of an old assembly-top layout, by explicit name.
+
+    Never a blanket *.yaml: the assembly tree's top level also holds ad-hoc
+    scripts and scratch, and a glob would sweep in whatever lands there later.
+    '''
+    names = [f'{name}.yaml' for name in QUEUES]
+    names += [COMPLETED_NAME, LOCK_NAME, ASSEMBLY_LOCK_NAME]
+    paths = [os.path.join(directory, name) for name in names]
+    paths += glob.glob(os.path.join(directory, PROCESSED_GLOB))
+    for name in QUEUES:
+        paths += glob.glob(os.path.join(directory, f'{name}.yaml.bak.*'))
+    return [p for p in paths if os.path.exists(p)]
+
+
+def resolveQueueDir(assemblyDir, queueDir=None, quiet=False,
+                    migrate=True):
+    '''
+    Where the queues and locks live: <assemblyDir>/autoupdate.
+
+    An explicit queueDir wins and is returned untouched -- it stays the escape
+    hatch and is never migrated. Otherwise the directory is created on first
+    use and any files of the old assembly-top layout are moved into it, which
+    happens once and then never again.
+
+    migrate=False reports where the queues are without touching anything, for
+    callers in --check mode: a dry run must not move files.
+
+    Migration is skipped while either lock is present, because something is
+    running. Moving .assemblyTree.lock out from under its holder would be the
+    worst outcome available: the holder's release would fail, and the next host
+    would find no lock in the new directory and start writing the same tree.
+    '''
+    assemblyDir = os.path.abspath(assemblyDir)
+    if queueDir:
+        return os.path.abspath(queueDir)
+    target = os.path.join(assemblyDir, QUEUE_DIR_NAME)
+    if os.path.isdir(target):
+        return target
+    legacy = legacyQueueFiles(assemblyDir)
+    if not migrate:
+        return assemblyDir if legacy else target
+    held = [p for p in legacy
+            if os.path.basename(p) in (LOCK_NAME, ASSEMBLY_LOCK_NAME)]
+    if held:
+        if not quiet:
+            print(f'queueS1: {os.path.basename(held[0])} is held; leaving the '
+                  f'queues in {assemblyDir} for now, the next run will move '
+                  f'them to {target}')
+        return assemblyDir
+    os.makedirs(target, exist_ok=True)
+    for path in legacy:
+        shutil.move(path, os.path.join(target, os.path.basename(path)))
+    if not quiet:
+        print(f'queueS1: moved {len(legacy)} queue file(s) to {target}')
+    return target
 
 
 def sweepTempFiles(queueDir):
@@ -311,6 +378,63 @@ def appendProcessed(queueDir, record, day=None):
         return True
 
 
+# --------------------------------------------------------------------------- #
+# notes
+#
+#   notes.yaml   things a person should see that no queue owns, because nothing
+#                is broken and nothing is waiting: the run made a choice worth
+#                recording. Append-only and deduped, so a nightly re-run of the
+#                same condition does not grow the file for ever.
+# --------------------------------------------------------------------------- #
+NOTES_NAME = 'notes.yaml'
+
+
+def notesPath(queueDir):
+    return os.path.join(queueDir, NOTES_NAME)
+
+
+def noteRecord(subject, comment, source, base=None):
+    '''
+    One note. subject identifies what it is about (a granule, a unit) and is
+    what deduping keys on together with comment, so re-stating the same fact
+    about the same subject is a no-op.
+    '''
+    record = dict(base) if base else {}
+    record['subject'] = subject
+    record['comment'] = comment
+    record['source'] = source
+    record['found'] = datetime.datetime.now().isoformat(timespec='seconds')
+    return record
+
+
+def appendNote(queueDir, record):
+    '''
+    Append one note unless (subject, comment) is already recorded. Returns True
+    if it was written.
+
+    The dedup matters more than it looks: the conditions that produce notes are
+    persistent states, not events, so every nightly run re-derives them. Without
+    it, one superseded granule left on disk would add a line a night for ever.
+    '''
+    path = notesPath(queueDir)
+    with queueLock(queueDir) as acquired:
+        if not acquired:
+            return False
+        notes = _readList(path)
+        key = (record.get('subject'), record.get('comment'))
+        for note in notes:
+            if isinstance(note, dict) and \
+                    (note.get('subject'), note.get('comment')) == key:
+                return False
+        _atomicDump(path, notes + [record])
+        return True
+
+
+def readNotes(queueDir):
+    ''' Every note on record, oldest first. '''
+    return _readList(notesPath(queueDir))
+
+
 def mergeProcessed(queueDir, retainDays=RETAIN_DAYS):
     '''
     Fold every processed.<date>.yaml into the all-time completed.yaml, then drop
@@ -359,6 +483,57 @@ def mergeProcessed(queueDir, retainDays=RETAIN_DAYS):
         return added, pruned
 
 
+CONFIG_POINTER = 'configPath'
+
+
+def recordConfigPath(queueDir, configPath):
+    '''
+    Note which autoupdate.yaml drives this queue directory.
+
+    The config lives beside the archive and the queues beside the assembly
+    tree, often on different volumes, and nothing else connects them. Standing
+    in the assembly directory there is otherwise no way to find the config that
+    governs it.
+    '''
+    path = os.path.join(queueDir, CONFIG_POINTER)
+    configPath = os.path.abspath(configPath)
+    try:
+        if os.path.exists(path):
+            with open(path) as fp:
+                if fp.read().strip() == configPath:
+                    return          # unchanged, leave the mtime alone
+        with open(path, 'w') as fp:
+            fp.write(f'{configPath}\n')
+    except OSError:
+        pass                        # a pointer is a convenience, never fatal
+
+
+def readConfigPath(queueDir):
+    ''' The autoupdate.yaml recorded for this queue directory, or None. '''
+    path = os.path.join(queueDir, CONFIG_POINTER)
+    try:
+        with open(path) as fp:
+            return fp.read().strip() or None
+    except OSError:
+        return None
+
+
+def lockState(queueDir, name):
+    '''
+    (held, holder, ageSeconds) for a lock, without ever taking it.
+
+    Read-only on purpose: --info and the CLI must report while a run is in
+    progress, which is exactly when the answer matters.
+    '''
+    path = os.path.join(queueDir, name)
+    try:
+        with open(path) as fp:
+            holder = fp.read().strip()
+        return True, holder, time.time() - os.path.getmtime(path)
+    except OSError:
+        return False, None, None
+
+
 def unnotified(queueDir):
     ''' problem records that have not been emailed yet. '''
     return [e for e in readQueue(queueDir, 'problem')
@@ -371,3 +546,114 @@ def markNotified(queueDir, units):
         return
     applyQueueDeltas(queueDir,
                      update={'problem': {u: {'notified': True} for u in units}})
+
+
+# --------------------------------------------------------------------------- #
+# CLI - the supported way to edit the queues by hand
+#
+# Run it from the assembly directory; the queue directory is found from there.
+# Editing the YAML in a text editor bypasses the lock, so a write landing
+# between another host's read and write silently loses entries.
+# --------------------------------------------------------------------------- #
+def findUnit(queues, unit):
+    ''' Which queue holds a unit, or None. '''
+    for name in QUEUES:
+        if any(entryUnit(e) == unit for e in queues[name]):
+            return name
+    return None
+
+
+def describe(queueDir):
+    ''' The lines of `queueS1 info`. '''
+    lines = [f'queueDir  {queueDir}']
+    configPath = readConfigPath(queueDir)
+    lines.append('config    '
+                 + (configPath or 'unknown (no autoupdateS1 run yet)'))
+    for name in (LOCK_NAME, ASSEMBLY_LOCK_NAME):
+        held, holder, age = lockState(queueDir, name)
+        if held:
+            lines.append(f'{name:<18} HELD by {holder} ({age / 3600:.1f} h)')
+        else:
+            lines.append(f'{name:<18} free')
+    queues = readQueues(queueDir)
+    for name in QUEUES:
+        lines.append(f'{name:<18} {len(queues[name])}')
+    completed = _readList(completedPath(queueDir))
+    lines.append(f'{"completed":<18} {len(completed)}')
+    lines.append(f'{"processed today":<18} '
+                 f'{len(_readList(processedPath(queueDir)))}')
+    return lines
+
+
+def parseQueueArgs():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='Inspect and edit the Sentinel-1 processing queues. Run '
+                    'from the assembly directory. This is the supported way '
+                    'to change a queue by hand: it takes the lock and writes '
+                    'atomically, which editing the YAML does not.',
+        epilog='Part of the asfSearchAndDownload package.')
+    parser.add_argument('action', choices=['info', 'list', 'remove',
+                                           'promote'],
+                        help='info: paths, locks and counts; list [queue]; '
+                             'remove UNIT...; promote UNIT... (problem -> '
+                             'toProcess)')
+    parser.add_argument('targets', nargs='*',
+                        help='queue name for list, else unit names '
+                             '(e.g. track-90/7086)')
+    parser.add_argument('--queueDir', type=str, default=None,
+                        help='Queue directory [default: found from the '
+                             'current directory]')
+    return parser.parse_args()
+
+
+def main():
+    args = parseQueueArgs()
+    queueDir = args.queueDir or resolveQueueDir(os.getcwd(), migrate=False)
+    if not os.path.isdir(queueDir):
+        raise SystemExit(f'queueS1: no queue directory at {queueDir} -- run '
+                         'from the assembly directory, or pass --queueDir')
+
+    if args.action == 'info':
+        print('\n'.join(describe(queueDir)))
+        return
+
+    queues = readQueues(queueDir)
+    if args.action == 'list':
+        names = args.targets or list(QUEUES)
+        for name in names:
+            if name not in QUEUES:
+                raise SystemExit(f'queueS1: no queue {name!r}; '
+                                 f'choose from {" ".join(QUEUES)}')
+            print(f'--- {name} ({len(queues[name])})')
+            for entry in queues[name]:
+                unit = entryUnit(entry)
+                comment = (entry.get('comment', '')
+                           if isinstance(entry, dict) else '')
+                print(f'  {unit}{"  " + comment if comment else ""}')
+        return
+
+    if not args.targets:
+        raise SystemExit(f'queueS1: {args.action} needs at least one unit')
+    # Refuse the whole call if any unit is unknown: a typo that silently did
+    # nothing would read as success and leave the queue as it was.
+    missing = [u for u in args.targets if findUnit(queues, u) is None]
+    if missing:
+        raise SystemExit('queueS1: not in any queue: ' + ' '.join(missing))
+
+    remove = {}
+    for unit in args.targets:
+        remove.setdefault(findUnit(queues, unit), []).append(unit)
+    add = {'toProcess': [{'unit': u} for u in args.targets]} \
+        if args.action == 'promote' else None
+    result = applyQueueDeltas(queueDir, remove=remove, add=add)
+    if result is None:
+        raise SystemExit('queueS1: the queue lock is busy; '
+                         'nothing was written')
+    verb = 'promoted to toProcess' if args.action == 'promote' else 'removed'
+    for queue, units in remove.items():
+        print(f'{verb}: {" ".join(units)}  (from {queue})')
+
+
+if __name__ == '__main__':
+    main()

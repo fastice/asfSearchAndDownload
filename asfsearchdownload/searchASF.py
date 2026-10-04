@@ -5,12 +5,15 @@ Supports NISAR (default) and Sentinel-1 platforms.
 """
 
 import argparse
+import datetime
 import glob
 import importlib.resources
 import json
+import logging
 import os
 import sys
 import threading
+import urllib.request
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +65,14 @@ _NISAR_EA_COLLECTIONS = [
     'C4052500045-ASF',  # NISAR_EA_L1  (RSLC, RIFG, RUNW, ROFF, …)
     'C4052499921-ASF',  # NISAR_EA_L2  (GCOV, GSLC, GUNW, GOFF, …)
 ]
+
+# Sentinel-1D is missing from asf_search's static collection tables
+# (asf_search/CMR/datasets.py names SENTINEL-1A/B/C but not -1D, as of
+# asf_search 12.2.0), so neither platform=SENTINEL-1 nor processingLevel=SLC
+# reaches it and a plain search silently returns no S1D at all. Query its
+# collections directly and merge. Remove this once asf_search ships S1D.
+_CMR_COLLECTIONS_URL = 'https://cmr.earthdata.nasa.gov/search/collections.json'
+_S1D_SHORTNAME = 'SENTINEL-1D*'
 
 
 def _wkt_to_cmr_polygon(wkt):
@@ -310,12 +321,98 @@ class _Spinner:
 # Archive helpers
 # ---------------------------------------------------------------------------
 
+def parseExcludeFrames(value):
+    ''' Parse "track:frame[,frame...] track:frame..." into {track: {frames}}.
+
+    Whitespace separates the track groups, commas the frames within a group:
+    "90:191 141:317,323". Raises ValueError on anything else, since silently
+    dropping a malformed entry would quietly resume downloading a frame
+    someone meant to exclude.
+    '''
+    excluded = {}
+    for group in value.split():
+        trackPart, sep, framePart = group.partition(':')
+        try:
+            if not sep:
+                raise ValueError
+            track = int(trackPart)
+            frames = {int(f) for f in framePart.split(',') if f}
+        except ValueError:
+            raise ValueError(f'--excludeFrames: cannot parse "{group}": '
+                             'expected track:frame[,frame], e.g. 90:191')
+        if not frames:
+            raise ValueError(f'--excludeFrames: no frames given for "{group}"')
+        excluded.setdefault(track, set()).update(frames)
+    return excluded
+
+
 def _strip_ext(name):
     """Strip .h5, .zip.1, or .zip from a filename (stem only, no path)."""
     for ext in ('.zip.1', '.zip', '.h5'):
         if name.endswith(ext):
             return name[:-len(ext)]
     return name
+
+
+def _s1_scene_key(stem):
+    """Acquisition identity of a Sentinel-1 granule name, or None.
+
+    Everything up to the trailing 4-character product id, so two products of
+    the same acquisition share it:
+
+        S1C_IW_SLC__1SDH_20260625T090707_20260625T090734_008260_01054F_96E9
+        S1C_IW_SLC__1SDH_20260625T090707_20260625T090734_008260_01054F_DC7D
+
+    Strict, and None for anything that is not Sentinel-1, so NISAR and every
+    other collection passing through this module are never deduped by it.
+    """
+    parts = _strip_ext(os.path.basename(stem)).split('_')
+    if len(parts) != 10:
+        return None
+    if len(parts[0]) != 3 or not parts[0].startswith('S1'):
+        return None
+    if not parts[7].isdigit() or len(parts[7]) != 6 or len(parts[9]) != 4:
+        return None
+    return '_'.join(parts[:9])
+
+
+def _drop_superseded_s1(results):
+    """Keep only the newest product for each Sentinel-1 acquisition.
+
+    ASF occasionally serves an acquisition reprocessed: same platform, same
+    start and stop to the microsecond, same orbit and datatake, a new product
+    id at the end of the name.  Downloading both is what breaks assembly two
+    stages later -- the copies unpack side by side into one orbit directory and
+    setupTrack finds 28 SAFEs against 14 SLC_tabs -- so the newer wins here,
+    before anything is fetched.
+
+    processingDate decides.  It is an ISO timestamp, so it compares lexically;
+    where it is missing or equal, the later of the two in the incoming order
+    wins, which is sorted by sceneName and therefore stable between runs.
+
+    Returns (kept, dropped) with dropped a list of (superseded, kept) names.
+    """
+    best = {}
+    for result in results:
+        scene = _s1_scene_key(result.properties.get('sceneName') or '')
+        if scene is None:
+            continue
+        held = best.get(scene)
+        if held is None or (str(result.properties.get('processingDate') or '')
+                            >= str(held.properties.get('processingDate') or '')):
+            best[scene] = result
+    if len(best) == sum(1 for r in results
+                        if _s1_scene_key(r.properties.get('sceneName') or '')):
+        return results, []                       # nothing shares a scene
+    kept, dropped = [], []
+    for result in results:
+        name = result.properties.get('sceneName') or ''
+        scene = _s1_scene_key(name)
+        if scene is None or best[scene] is result:
+            kept.append(result)
+        else:
+            dropped.append((name, best[scene].properties.get('sceneName')))
+    return kept, dropped
 
 
 def _extract_url(result, use_s3):
@@ -411,6 +508,39 @@ def _nisar_parse(stem):
     return scene_key, version, crid_num
 
 
+def _drop_superseded_nisar(items):
+    """Keep only the newest product for each NISAR granule.
+
+    ASF sometimes serves the same granule twice: identical name up to the
+    trailing product counter (..._001 and a reprocessed ..._002), or a newer
+    CRID for the same acquisition.  Mosaicking both double-counts the frame,
+    so only the newest is kept -- highest CRID, then highest counter.  The
+    identity is _nisar_parse's scene_key, which excludes both fields.
+
+    items are the (url, track, frame, size_bytes, ...) tuples built in main().
+    Names _nisar_parse does not recognise pass through untouched.
+
+    Returns (kept, dropped) with dropped a list of (superseded, kept) stems.
+    """
+    best = {}
+    for item in items:
+        scene, ver, crid = _nisar_parse(_strip_ext(os.path.basename(item[0])))
+        if scene is None:
+            continue
+        held = best.get(scene)
+        if held is None or (crid, ver) > held[1]:
+            best[scene] = (item, (crid, ver))
+    kept, dropped = [], []
+    for item in items:
+        stem = _strip_ext(os.path.basename(item[0]))
+        scene, _, _ = _nisar_parse(stem)
+        if scene is None or best[scene][0] is item:
+            kept.append(item)
+        else:
+            dropped.append((stem, _strip_ext(os.path.basename(best[scene][0][0]))))
+    return kept, dropped
+
+
 def build_archive_index(archive_glob, sensor):
     """Glob archive_glob and return a sensor-appropriate index.
 
@@ -455,6 +585,158 @@ def build_archive_index(archive_glob, sensor):
     n = len(s1_index) if sensor == 'SENTINEL1' else len(nisar_index)
     print(f'Archive: {n} {sensor} granule(s) indexed from {archive_glob}')
     return s1_index, nisar_index
+
+
+class _IncompleteWatcher(logging.Handler):
+    ''' Catch the asf_search log records that report a partially-delivered CMR
+    response.
+
+    Matches only "Results may be incomplete due to a search error", which
+    asf_search logs from search() exactly when results.searchComplete is False
+    -- the paging loop gave up before reaching the count CMR reported. That is
+    the authoritative signal that granules were lost, and it is logged rather
+    than raised, so the caller otherwise sees a plausible but short list.
+
+    Deliberately NOT matched: "CMR returned page of incomplete results.Expected
+    250 results, got 109". That fires per page whenever a page comes back under
+    CMR_PAGE_SIZE, but the loop then continues through CMR-Search-After and
+    normally reaches the full count anyway -- so it is noisy, frequently benign,
+    and treating it as fatal aborts good searches. The nightly Antarctic log
+    carries 28 of those against a single genuine searchComplete failure.
+
+    Only installed under --strictComplete, so the default path (and every
+    nightly download job) behaves exactly as before. Downloads tolerate a short
+    result: they re-search a rolling window and dedup against the archive, so a
+    granule missed tonight is fetched tomorrow. A one-shot inventory has no such
+    second chance, which is what this is for. '''
+
+    PATTERNS = ('Results may be incomplete',)
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.hits = []
+
+    def emit(self, record):
+        text = record.getMessage()
+        if any(p in text for p in self.PATTERNS):
+            self.hits.append(' '.join(text.split()))
+
+    def reset(self):
+        self.hits = []
+
+
+def _searchStrict(doSearch, attempts=3):
+    ''' Run doSearch(), re-running it while asf_search reports an incomplete CMR
+    response. Returns (results, hits) with hits empty on a clean run; a caller
+    that still sees hits after `attempts` tries should treat the result as
+    short. '''
+    watcher = _IncompleteWatcher()
+    logger = logging.getLogger('asf_search')
+    logger.addHandler(watcher)
+    try:
+        for attempt in range(1, attempts + 1):
+            watcher.reset()
+            results = doSearch()
+            if not watcher.hits:
+                return results, []
+            print(f'CMR returned an incomplete response '
+                  f'(attempt {attempt}/{attempts}): {watcher.hits[0]}',
+                  file=sys.stderr)
+        return results, list(watcher.hits)
+    finally:
+        logger.removeHandler(watcher)
+
+
+def _search_windowed(runSearch, common, maxResults, label):
+    ''' Run runSearch(common) over its date range, splitting the range in half
+    and recursing whenever a query comes back saturated.
+
+    A saturated result is silently truncated by CMR, so the granules past the
+    cap are simply missing -- the old code could only warn after the fact.
+    Halving is adaptive: a search that fits does one query, and only the dense
+    windows pay for extra ones. Sub-windows are disjoint (`start` is exclusive
+    of the previous `end` by one second) so nothing is fetched twice.
+
+    Stops splitting at a one-second window, where there is nothing left to
+    divide, and warns -- that many granules in one second means the cap is
+    being hit for some reason other than window size. '''
+    start = _iso_to_dt(common['start'])
+    end = _iso_to_dt(common['end'])
+    results = list(runSearch(common))
+    if len(results) < maxResults:
+        return results
+    if (end - start).total_seconds() < 2:
+        print(f'WARNING: {label} still saturated at {maxResults} in a '
+              f'one-second window ({common["start"]}); results incomplete.',
+              file=sys.stderr)
+        return results
+    middle = start + (end - start) / 2
+    firstHalf = dict(common, end=_dt_to_iso(middle))
+    secondHalf = dict(common,
+                      start=_dt_to_iso(middle + datetime.timedelta(seconds=1)))
+    return (_search_windowed(runSearch, firstHalf, maxResults, label)
+            + _search_windowed(runSearch, secondHalf, maxResults, label))
+
+
+def _iso_to_dt(text):
+    ''' 'YYYY-MM-DDTHH:MM:SSZ' -> datetime. '''
+    return datetime.datetime.strptime(text, '%Y-%m-%dT%H:%M:%SZ')
+
+
+def _dt_to_iso(when):
+    ''' datetime -> 'YYYY-MM-DDTHH:MM:SSZ'. '''
+    return when.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _s1d_collection_ids(timeout=30):
+    ''' CMR concept-ids for the Sentinel-1D product collections at ASF.
+
+    Looked up by short-name wildcard rather than hardcoded, so new S1D
+    collections are picked up and a re-issued concept-id does not go stale.
+    META_ collections are skipped: they carry a duplicate record per granule
+    (processingLevel METADATA_SLC alongside SLC) and would double every count.
+    Returns [] and warns on any failure -- a CMR hiccup should degrade the
+    search to its pre-S1D behaviour, not abort it. '''
+    query = (f'{_CMR_COLLECTIONS_URL}?provider=ASF&short_name={_S1D_SHORTNAME}'
+             '&options[short_name][pattern]=true&page_size=100')
+    try:
+        with urllib.request.urlopen(query, timeout=timeout) as response:
+            entries = json.load(response)['feed']['entry']
+    except Exception as error:                      # network, JSON, or schema
+        print(f'Warning: could not list Sentinel-1D collections ({error}); '
+              'searching without S1D', file=sys.stderr)
+        return []
+    return [e['id'] for e in entries if '_META_' not in e['short_name']]
+
+
+def _search_s1d(products, beamMode, common):
+    ''' Sentinel-1D granules matching `products`, via a direct collection query.
+
+    processingLevel is filtered here rather than passed to asf.search: the
+    server-side filter is driven by the same table that omits S1D, so it
+    matches nothing. The collection query is already narrow (S1D has no BURST
+    collection, the usual reason an unfiltered S1 search explodes).
+
+    Results are rebuilt as S1Product. Not knowing the S1D collections,
+    asf_search hands back a generic ASFProduct, which reads three properties
+    from different places than S1Product does -- frameNumber comes from
+    CENTER_ESA_FRAME rather than FRAME_NUMBER (2299 where S1A/B/C would say
+    378, an entirely different numbering), and groupID/pgeVersion come back
+    None. Rebuilding from the same umm/meta puts S1D on the S1A/B/C
+    conventions, so everything downstream can treat the satellites alike. '''
+    import asf_search as asf     # imported lazily, as in main()
+    from asf_search.Products import S1Product
+
+    ids = _s1d_collection_ids()
+    if not ids:
+        return []
+    wanted = set(products or [])
+    results = _search_windowed(
+        lambda c: asf.search(collections=ids, beamMode=beamMode, **c),
+        common, common['maxResults'], 'Sentinel-1D')
+    return [S1Product({'umm': r.umm, 'meta': r.meta}, session=r.session)
+            for r in results
+            if not wanted or r.properties.get('processingLevel') in wanted]
 
 
 def _default_search_area():
@@ -756,6 +1038,22 @@ Part of the asfSearchAndDownload package.
         help='Maximum relative orbit / track number (default: all)',
     )
     parser.add_argument(
+        '--excludeTracks', type=str, default='', metavar='"N N ..."',
+        help='Tracks never to list, whatever the range allows, as one quoted '
+             'space- or comma-separated value: --excludeTracks "114 143 155". '
+             'One value rather than a list so it cannot swallow the trailing '
+             'firstDate/lastDate/output arguments (default: exclude none)',
+    )
+    parser.add_argument(
+        '--excludeFrames', type=str, default='', metavar='"T:F,F T:F ..."',
+        help='Per-track frames never to list, as one quoted value: '
+             '--excludeFrames "90:191 141:317,323". A search area drawn for a '
+             'whole region clips frames that sit just outside an individual '
+             "track's frameRange; those get downloaded and then binned to "
+             'track-N/tmp every cycle. Scoped per track so excluding one '
+             'cannot affect another (default: exclude none)',
+    )
+    parser.add_argument(
         '--startFrame', type=int, default=0, metavar='N',
         help='Minimum frame number (default: all)',
     )
@@ -808,12 +1106,30 @@ Part of the asfSearchAndDownload package.
 
     # --- GeoPackage export ---
     parser.add_argument(
+        '--metadata', action='store_true',
+        help='Also write <output>.meta: one line per granule with granule, '
+             'track, frame, status, size and url. Unlike <output>, this '
+             'includes granules already archived ("exists"), so a consumer '
+             'can see everything ASF holds, not just what is missing. Used by '
+             'findS1InsarPairs --onlinePairs to pair an undownloaded granule '
+             'with one already on disk.')
+    parser.add_argument(
         '--gpkg', default=None, metavar='FILE',
         help='Write footprints to a GeoPackage (QGIS-ready). '
              'One layer per product type (RUNW, ROFF, RSLC, …) so each can '
              'be toggled independently.  A "status" field marks granules as '
              '"found" (new), "exists" (already archived), or "updated" '
              '(newer version available).  Example: --gpkg search.gpkg',
+    )
+
+    parser.add_argument(
+        '--strictComplete', action='store_true', default=False,
+        help='Re-run the search when CMR returns an incomplete response, and '
+             'exit non-zero rather than write a possibly-short result. For '
+             'one-shot inventories (coverage maps, catalogs) where a short '
+             'answer is indistinguishable from missing data. Off by default: '
+             'rolling-window download jobs recover on the next run and should '
+             'not abort.',
     )
 
     # --- S3 direct access ---
@@ -955,31 +1271,65 @@ Part of the asfSearchAndDownload package.
     if args.flightDirection:
         _common['flightDirection'] = args.flightDirection
 
-    spinner = _Spinner(f'Searching ASF ({args.sensor})...').start()
-    try:
+    def _runFullSearch():
         if args.sensor == 'NISAR':
-            results = list(asf.search(
-                platform=[asf.PLATFORM.NISAR],
-                processingLevel=args.products,
-                rangeBandwidth=args.bandwidth,
-                **_common,
-            ))
-        else:  # SENTINEL1
-            results = list(asf.search(
+            return _search_windowed(
+                lambda c: asf.search(
+                    platform=[asf.PLATFORM.NISAR],
+                    processingLevel=args.products,
+                    rangeBandwidth=args.bandwidth,
+                    **c,
+                ), _common, MAX_RESULTS, 'NISAR')
+        # SENTINEL1
+        found = _search_windowed(
+            lambda c: asf.search(
                 platform=[asf.PLATFORM.SENTINEL1],
                 processingLevel=args.products,
                 beamMode=args.beamMode,
-                **_common,
-            ))
+                **c,
+            ), _common, MAX_RESULTS, 'Sentinel-1')
+        # platform=SENTINEL-1 does not cover Sentinel-1D (see
+        # _s1d_collection_ids); fetch and merge it separately.
+        s1d = _search_s1d(args.products, args.beamMode, _common)
+        if s1d:
+            print(f'Sentinel-1D: {len(s1d)} granule(s) added by collection '
+                  'query', file=sys.stderr)
+            found += s1d
+        return found
+
+    spinner = _Spinner(f'Searching ASF ({args.sensor})...').start()
+    try:
+        if args.strictComplete:
+            results, incomplete = _searchStrict(_runFullSearch)
+        else:
+            results, incomplete = _runFullSearch(), []
     finally:
         spinner.stop()
 
-    if len(results) >= MAX_RESULTS:
-        print(
-            f'WARNING: result count hit the {MAX_RESULTS} limit — '
-            'results may be incomplete.',
-            file=sys.stderr,
-        )
+    # Only reachable under --strictComplete. Refusing to write a short catalog
+    # is the point: a silently-short inventory reads as missing data.
+    if incomplete:
+        sys.exit(f'ERROR: CMR kept returning incomplete results for '
+                 f'{args.firstDate}..{args.lastDate} ({incomplete[0]}); '
+                 f'refusing to write a possibly-short result. Re-run later.')
+
+    # One chronological order for everything that follows -- the S1D results are
+    # appended after the S1A/B/C ones, and a windowed search returns its chunks
+    # back to back, so neither is time-ordered on its own.
+    results.sort(key=lambda r: (r.properties.get('startTime') or '',
+                                r.properties.get('sceneName') or ''))
+
+    # Reprocessed Sentinel-1 products, both offered at once: take the newer and
+    # never fetch the pair. Done on the sorted list so the choice is stable.
+    results, superseded = _drop_superseded_s1(results)
+    for name, kept in superseded:
+        print(f'superseded: {name}\n  keeping: {kept}')
+    if superseded:
+        print(f'dropped {len(superseded)} superseded S1 product(s)')
+
+    # No post-hoc "hit the limit" warning any more: _search_windowed splits a
+    # saturated window and re-queries instead of returning a truncated list, and
+    # warns itself in the one case it cannot subdivide further.
 
     # ------------------------------------------------------------------
     # Build unified (url, track, frame) list from asf_search + NISAR_EA
@@ -1056,6 +1406,15 @@ Part of the asfSearchAndDownload package.
             print(f'Deduped:   {n_dupes} duplicate(s) removed '
                   f'({len(all_items)} unique granules)')
 
+    # Same NISAR granule served more than once (new product counter or CRID):
+    # keep only the newest so it is neither downloaded nor mosaicked twice.
+    if args.sensor == 'NISAR':
+        all_items, superseded = _drop_superseded_nisar(all_items)
+        for name, kept in superseded:
+            print(f'superseded: {name}\n  keeping: {kept}')
+        if superseded:
+            print(f'dropped {len(superseded)} superseded NISAR product(s)')
+
     # ------------------------------------------------------------------
     # URL → footprint geometry map (for GeoPackage export).
     # asf_search results carry a .geometry GeoJSON dict; EA items do not.
@@ -1063,7 +1422,7 @@ Part of the asfSearchAndDownload package.
     # Public asf_search results carry .geometry; EA items carry geometry in the
     # 5th tuple element (extracted from CMR polygons/boxes fields).
     url_to_geometry = {}
-    if args.gpkg:
+    if args.gpkg or args.metadata:
         for result in results:
             _url = result.properties.get('url', '')
             if _url:
@@ -1084,8 +1443,15 @@ Part of the asfSearchAndDownload package.
     # ------------------------------------------------------------------
     filter_track = args.startTrack > 0 or args.endTrack < _ALL_MAX
     filter_frame = args.startFrame > 0 or args.endFrame < _ALL_MAX
+    exclude_tracks = {int(t) for t in
+                      args.excludeTracks.replace(',', ' ').split()}
+    exclude_frames = parseExcludeFrames(args.excludeFrames)
+    if exclude_frames:
+        print('Excluding frames: ' + ' '.join(
+            f'{t}:{",".join(str(f) for f in sorted(fr))}'
+            for t, fr in sorted(exclude_frames.items())))
 
-    gpkg_records = []   # populated when --gpkg is set
+    gpkg_records = []   # populated when --gpkg or --metadata is set
 
     exists_path  = args.output + '.exists'
     updated_path = args.output + '.updated'
@@ -1098,6 +1464,8 @@ Part of the asfSearchAndDownload package.
     n_updated        = 0
     n_ver_skip       = 0
     n_specver_skip   = 0
+    n_excluded       = 0
+    n_frame_excluded = 0
     volume_by_product = {}   # product_type -> total bytes (Found items only)
     try:
         out_fp = open(args.output, 'w')
@@ -1108,6 +1476,17 @@ Part of the asfSearchAndDownload package.
             if filter_track:
                 if track is None or not (args.startTrack <= track <= args.endTrack):
                     continue
+            # Excluded tracks: dropped whatever the range allows, since the
+            # range cannot take a track out of the middle of the set
+            if exclude_tracks and track in exclude_tracks:
+                n_excluded += 1
+                continue
+            # Per-track frame exclusions: a frame the region outline clips in
+            # but this track's frameRange puts out of range, so it would be
+            # downloaded and then binned to track-N/tmp every cycle.
+            if frame in exclude_frames.get(track, ()):
+                n_frame_excluded += 1
+                continue
             if filter_frame:
                 if frame is None or not (args.startFrame <= frame <= args.endFrame):
                     continue
@@ -1136,7 +1515,7 @@ Part of the asfSearchAndDownload package.
                             exists_fp = open(exists_path, 'w')
                         exists_fp.write(url + '\n')
                         n_skipped += 1
-                        if args.gpkg:
+                        if args.gpkg or args.metadata:
                             gpkg_records.append(_gpkg_record(
                                 url, track, frame, size_bytes,
                                 stem, 'exists', url_to_geometry))
@@ -1151,7 +1530,7 @@ Part of the asfSearchAndDownload package.
                                 exists_fp = open(exists_path, 'w')
                             exists_fp.write(url + '\n')
                             n_skipped += 1
-                            if args.gpkg:
+                            if args.gpkg or args.metadata:
                                 gpkg_records.append(_gpkg_record(
                                     url, track, frame, size_bytes,
                                     stem, 'exists', url_to_geometry))
@@ -1161,7 +1540,7 @@ Part of the asfSearchAndDownload package.
                                 updated_fp = open(updated_path, 'w')
                             updated_fp.write(url + '\n')
                             n_updated += 1
-                            if args.gpkg:
+                            if args.gpkg or args.metadata:
                                 gpkg_records.append(_gpkg_record(
                                     url, track, frame, size_bytes,
                                     stem, 'updated', url_to_geometry))
@@ -1169,7 +1548,7 @@ Part of the asfSearchAndDownload package.
 
             out_fp.write(url + '\n')
             n_found += 1
-            if args.gpkg:
+            if args.gpkg or args.metadata:
                 gpkg_records.append(_gpkg_record(
                     url, track, frame, size_bytes,
                     stem, 'found', url_to_geometry))
@@ -1205,6 +1584,13 @@ Part of the asfSearchAndDownload package.
         parts.append(f'Below --minVersion {args.minVersion}: {n_ver_skip}')
     if n_specver_skip:
         parts.append(f'Not in --specificVersion {args.specificVersion}: {n_specver_skip}')
+    if n_excluded:
+        excluded = ' '.join(str(t) for t in sorted(exclude_tracks))
+        parts.append(f'Excluded tracks {excluded}: {n_excluded}')
+    if n_frame_excluded:
+        byTrack = ' '.join(f'{t}:{",".join(str(f) for f in sorted(fr))}'
+                           for t, fr in sorted(exclude_frames.items()))
+        parts.append(f'Excluded frames {byTrack}: {n_frame_excluded}')
     print('  '.join(parts))
     if volume_by_product:
         vol_parts = [
@@ -1212,6 +1598,22 @@ Part of the asfSearchAndDownload package.
             for prod, nbytes in sorted(volume_by_product.items())
         ]
         print('Volume: ' + '  '.join(vol_parts))
+
+    if args.metadata:
+        # Every granule the search matched, archived or not, with the track and
+        # frame the search result carried. A consumer can then pair granules
+        # without opening any zip -- the ascending node time needed for the
+        # GrIMP burst frame is only inside the SAFE, but the ASF frame is
+        # repeat-stable and serves the same purpose for pairing.
+        meta_path = args.output + '.meta'
+        with open(meta_path, 'w') as meta_fp:
+            meta_fp.write('# granule track frame status sizeBytes url\n')
+            for rec in gpkg_records:
+                meta_fp.write(f"{rec.get('granule')} {rec.get('track')} "
+                              f"{rec.get('frame')} {rec.get('status')} "
+                              f"{rec.get('size_bytes', 0)} "
+                              f"{rec.get('url')}\n")
+        print(f'Metadata: {len(gpkg_records)} granule(s) -> {meta_path}')
 
     if args.gpkg and gpkg_records:
         from asfsearchdownload.writeSearchGpkg import write_search_gpkg

@@ -16,8 +16,14 @@ New passes are filed under archiveDir/<YYYY>-<MM>/ where the month comes from
 the first date token in the granule name. A pass already present as .zip or
 .zip.1 (the .1 marks an already-processed file) is not re-downloaded.
 
-Part of the asfSearchAndDownload package.
-"""
+**Use `queueS1` to manage the queues, never a text editor.** It takes the queue
+lock and writes atomically; an editor does neither, so a write landing between
+another host's read and write silently loses entries. `queueS1 info` shows the
+paths, lock states and counts; `queueS1 remove/promote UNIT` edits them. Run
+it from the assembly directory. `autoupdateS1 --info` prints the same picture
+plus the config and archive paths.
+
+Part of the asfSearchAndDownload package."""
 import argparse
 import calendar
 import contextlib
@@ -53,6 +59,19 @@ regionFlags = {
     'greenland': '--greenland',
 }
 
+DEFAULT_CONFIG = 'autoupdate.yaml'
+
+# Shown by --help and at the end of --info: the queues are edited often enough
+# by hand that the safe way to do it belongs where it will be seen.
+QUEUE_NOTE = (
+    '\033[1mUse queueS1 to manage the processing queues, never a text '
+    'editor.\033[0m\n'
+    'It takes the queue lock and writes atomically; an editor does neither, '
+    'so a\nwrite landing between another host\'s read and write silently '
+    'loses entries.\n'
+    'Run it from the assembly directory:\n'
+    '    queueS1 info | list [queue] | remove UNIT... | promote UNIT...')
+
 # First date token in an S1 granule name, e.g. ..._20260115T063045_...
 DATE_TOKEN = re.compile(r'(\d{8})T\d{6}')
 
@@ -68,9 +87,12 @@ def parseArgs():
     parser = argparse.ArgumentParser(
         description='\n\n\033[1mAutomated Sentinel-1 IW SLC archive-update '
         'driver, configured by autoupdate.yaml\033[0m\n\n',
-        epilog='Part of the asfSearchAndDownload package.')
-    parser.add_argument('config', type=str, nargs='?', default='autoupdate.yaml',
-                        help='Path to autoupdate.yaml (default: ./autoupdate.yaml)')
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f'{QUEUE_NOTE}\n\nPart of the asfSearchAndDownload package.')
+    parser.add_argument('config', type=str, nargs='?', default=DEFAULT_CONFIG,
+                        help=f'Path to autoupdate.yaml (default: '
+                        f'./{DEFAULT_CONFIG}, or the config recorded in the '
+                        'queue directory when run from the assembly tree)')
     parser.add_argument('--maxDownloads', type=int, default=None,
                         help='Soft cap on downloads per run (0 = no limit); '
                         'overrides the config maxDownloads key [default 300]. '
@@ -89,6 +111,9 @@ def parseArgs():
     parser.add_argument('--searchArea', type=str, default=None,
                         help='GeoJSON/.shp/lon,lat search polygon; overrides '
                         'config and --region')
+    parser.add_argument('--connections', type=int, default=None,
+                        help='aria2c -x connections per server; overrides '
+                        "ariaDownload's time-of-day default [time of day]")
     parser.add_argument('--noOrbits', action='store_true',
                         help='Skip the state-vector (orbit) refresh')
     parser.add_argument('--noDownload', action='store_true',
@@ -116,6 +141,10 @@ def parseArgs():
                         help='Dry run across every stage: report what would be '
                         'downloaded, filed, or written without modifying '
                         'anything on disk')
+    parser.add_argument('--info', action='store_true',
+                        help='Report the paths, lock states and queue counts '
+                        'and exit. Reads only, so it works while a run holds '
+                        'the locks')
     refreshOrbits.addSensorArgs(parser)
     return parser.parse_args()
 
@@ -170,6 +199,7 @@ class _SessionSummary:
         self.failedUrls = []
         self.notes = []
         self.problems = []
+        self.duplicates = []
         self.problemQueue = None
         self.lowDisk = False
 
@@ -181,14 +211,34 @@ class _SessionSummary:
         ''' Record a free-standing line (a warning worth surfacing). '''
         self.notes.append(text)
 
+    def addDuplicate(self, name, held):
+        '''
+        A granule not downloaded because another product of the same
+        acquisition is already held.  Worth mailing every time: nothing is
+        broken, but ASF has reprocessed something and which copy to keep is a
+        decision for a person.
+        '''
+        self.duplicates.append((name, held))
+
     def addFailures(self, urls):
         self.failedUrls.extend(urls)
 
     def addProblems(self, records, queueDir):
         ''' Problem-queue records not yet notified. Read from the queue file
         rather than from this run's new entries, so units another tool (e.g.
-        setupTrack) added since the last run are picked up too. '''
-        self.problems.extend(records)
+        setupTrack) added since the last run are picked up too.
+
+        Called once per stage that can route a unit to problem, so it keeps to
+        one record per unit: the frame check and the assemble stage both sweep,
+        and a unit the frame check already reported must not be listed twice.
+        '''
+        seen = {e.get('unit') for e in self.problems if isinstance(e, dict)}
+        for record in records:
+            unit = record.get('unit') if isinstance(record, dict) else None
+            if unit is not None and unit in seen:
+                continue
+            self.problems.append(record)
+            seen.add(unit)
         self.problemQueue = queueDir
 
     def _body(self, logPath):
@@ -212,6 +262,20 @@ class _SessionSummary:
             lines += ['', f'links for a manual retry: '
                           f'{failuresPathFor(logPath)}',
                       f'  ariaDownload {failuresPathFor(logPath)}']
+        if self.duplicates:
+            lines += ['',
+                      f'{len(self.duplicates)} granule(s) not downloaded: ASF '
+                      'holds another product of the same acquisition',
+                      '  (same platform, start, stop, orbit and datatake; a '
+                      'different product id)',
+                      '  the copy already in the archive was kept and nothing '
+                      'was removed:']
+            for name, held in self.duplicates[:self.MAX_PROBLEMS]:
+                lines.append(f'  not fetched : {name}')
+                lines.append(f'  already had : {held}')
+            if len(self.duplicates) > self.MAX_PROBLEMS:
+                lines.append(f'  ... and '
+                             f'{len(self.duplicates) - self.MAX_PROBLEMS} more')
         if self.problems:
             lines += ['', f'{len(self.problems)} unit(s) newly in the problem '
                           'queue:']
@@ -265,7 +329,7 @@ def failuresPathFor(logPath):
 
 
 def sessionSubject(projectDir, host, failed, nUrls, nProblems,
-                   lowDisk=False):
+                   lowDisk=False, nDuplicates=0):
     '''
     Subject line naming every reason this run is being mailed, so several
     triggers still produce exactly one email. The wording of each single-trigger
@@ -276,6 +340,8 @@ def sessionSubject(projectDir, host, failed, nUrls, nProblems,
         parts.append(f'{nUrls} download(s) failed')
     if nProblems:
         parts.append(f'{nProblems} new problem unit(s)')
+    if nDuplicates:
+        parts.append(f'{nDuplicates} duplicate product(s) not downloaded')
     if lowDisk:
         parts.append('LOW DISK')
     if failed:
@@ -323,7 +389,10 @@ def assemblyLockPath(config):
     LOCK_DOWNLOAD stays in the project dir: it guards archiveDir, which is
     per-project.
     '''
-    return os.path.join(os.path.abspath(config['assemblyDir']), LOCK_FILE)
+    # Beside the queues, so every control file shares one directory
+    return os.path.join(
+        queueS1.resolveQueueDir(config['assemblyDir'],
+                                config.get('queueDir')), LOCK_FILE)
 
 
 def _tryLock(lockPath, staleHours):
@@ -435,6 +504,65 @@ def configList(value, default):
     return [str(value)]
 
 
+EXCLUDE_FRAMES_FILE = 'excludeFrames'
+
+
+def excludedFramesSpec(config):
+    '''
+    Per-track ASF frame exclusions, as the "T:F,F T:F" value searchASF takes.
+
+    Read from <assemblyDir>/track-N/excludeFrames -- one line of frame numbers
+    (# comments allowed), deliberately beside that track's frameRange rather
+    than in autoupdate.yaml: the two only make sense together, so widening a
+    frameRange puts its exclusions right there to be re-checked.
+
+    These are frames a region-wide search outline clips in while the track's
+    own frameRange puts them out of range. Without this they are downloaded,
+    reduced, filed and then binned to track-N/tmp on every cycle -- 1.07 TB
+    across 7 Greenland tracks by 2026-08. Excluding at search time is scoped
+    per track, so it cannot affect a track that does want that frame.
+
+    Returns '' when nothing is configured, which leaves the search unchanged.
+    '''
+    assemblyDir = config.get('assemblyDir')
+    if not assemblyDir:
+        return ''
+    groups = []
+    for path in sorted(glob.glob(os.path.join(assemblyDir, 'track-*',
+                                              EXCLUDE_FRAMES_FILE))):
+        track = os.path.basename(os.path.dirname(path)).split('track-')[-1]
+        frames = []
+        try:
+            with open(path) as fp:
+                for line in fp:
+                    line = line.split('#')[0]
+                    frames += [int(f) for f in line.replace(',', ' ').split()]
+        except (OSError, ValueError) as exc:
+            u.mywarning(f'ignoring {path}: {exc}')
+            continue
+        if frames:
+            groups.append(f'{track}:{",".join(str(f) for f in sorted(set(frames)))}')
+    return ' '.join(groups)
+
+
+def excludedTracks(config):
+    '''
+    Tracks the config says never to touch, as a sorted list of ints.
+
+    Honoured at every stage that can act on a track: search (never listed),
+    filing (never unpacked) and the frame check (never queued). Absent means
+    exclude nothing, so a config without the key behaves as it always has.
+    '''
+    tracks = []
+    for token in configList(config.get('tracksToExclude'), ''):
+        try:
+            tracks.append(int(token))
+        except ValueError:
+            u.myerror(f'autoupdateS1: tracksToExclude wants track numbers, '
+                      f'got {token!r}')
+    return sorted(set(tracks))
+
+
 def resolveSensors(config, args):
     '''
     Return the selected sensors. The CLI --S1A/--S1B/--S1C/--S1D flags win if any
@@ -527,11 +655,22 @@ def searchGranules(config, args, today, firstDate, lastDate, check=False):
     archiveGlob = os.path.join(archiveDir, '*', '*')
     products = configList(config.get('productType'), 'SLC')
     beamModes = configList(config.get('beamMode'), 'IW')
+    excluded = excludedTracks(config)
+    # One argument, not several: searchASF takes the trailing firstDate,
+    # lastDate and output as positionals, and a multi-value option placed
+    # before them swallows the lot
+    excludeFlags = (['--excludeTracks', ' '.join(str(t) for t in excluded)]
+                    if excluded else [])
+    frameSpec = excludedFramesSpec(config)
+    if frameSpec:
+        log.info(f'excluding out-of-range frames: {frameSpec}')
+        excludeFlags += ['--excludeFrames', frameSpec]
     command = (['searchASF', '--sensor', 'SENTINEL1',
                 '--products'] + products + ['--beamMode'] + beamModes
                + ['--archiveDir', archiveGlob, '--gpkg', gpkg]
                + directionFlags(config)
                + spatialFlags(config, args)
+               + excludeFlags
                + [firstDate, lastDate, out])
     log.info('search: ' + ' '.join(command))
     subprocess.run(command, check=True)
@@ -604,6 +743,269 @@ def granuleInArchive(archiveDir, name):
     return False
 
 
+def archiveCopy(archiveDir, name):
+    '''
+    Path of this granule inside its own YYYY-MM month dir (.zip or .zip.1), or
+    None.
+
+    Deliberately narrower than granuleInArchive, which globs archiveDir/*/ and
+    so also matches old/, junk/ and searchResults/. A hit in one of those would
+    satisfy a "do I already have it?" test while being invisible to consumers
+    that look only in the month dirs (Sentinel1Phase.runS1interferogram
+    globs [0-9][0-9][0-9][0-9]-[0-9][0-9]). The month dir is deterministic from
+    the granule name, so this checks exactly where the file has to be.
+    '''
+    monthDir = monthDirFor(archiveDir, name)
+    if monthDir is None:
+        return None
+    stem = stripArchiveExt(os.path.basename(name))
+    for ext in ('.zip', '.zip.1'):
+        candidate = os.path.join(monthDir, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def sceneKey(name):
+    '''
+    The acquisition identity of a granule name: everything but the product id.
+
+    S1C_IW_SLC__1SDH_20260625T090707_20260625T090734_008260_01054F_96E9 keys on
+    everything up to and including the datatake, so two products of the same
+    acquisition share it and differ only in the trailing id.
+    '''
+    stem = stripArchiveExt(name)
+    scene, _, product = stem.rpartition('_')
+    return scene if scene and product else None
+
+
+def duplicateInArchive(archiveDir, name):
+    '''
+    A granule already held for this acquisition under a different product id.
+
+    ASF occasionally serves an acquisition reprocessed: same platform, same
+    start and stop to the microsecond, same orbit and datatake, a new product
+    id at the end of the name.  Track-112 orbit 8260 arrived that way, the two
+    runs processed a day apart, and both copies unpacked into the same orbit
+    directory -- leaving setupTrack with 28 SAFEs against 14 SLC_tabs and the
+    orbit failed at trimTopsSLCsToFit.
+
+    The copy already held is kept and the new one is not downloaded: whichever
+    is wanted, having both is what breaks the assembly, and choosing between
+    them is not something to do unattended.  Returns the granule already held,
+    or None.
+    '''
+    scene = sceneKey(name)
+    if scene is None:
+        return None
+    stem = stripArchiveExt(name)
+    for ext in ('.zip', '.zip.1'):
+        for held in sorted(glob.glob(os.path.join(archiveDir, '*',
+                                                  f'{scene}_*{ext}'))):
+            if stripArchiveExt(os.path.basename(held)) != stem:
+                return os.path.basename(held)
+    return None
+
+
+# What to do about a reprocessed product when a copy is already held. Which one
+# is wanted turns on how far the held copy has got, not on the products.
+DUP_REPLACE = 'replace'
+DUP_NOTE = 'note'
+
+
+def heldUnitDir(assemblyDir, name):
+    '''
+    The unit directory holding this granule's .SAFE, or None if it is not filed
+    anywhere under assemblyDir.
+
+    Targeted rather than a tree walk: the track and orbit fall out of the name,
+    so this stats a couple of known paths instead of globbing 62k .SAFEs over
+    NFS -- the difference rearmPartialSafes measured as 7 minutes against a few
+    seconds.
+    '''
+    if not assemblyDir:
+        return None
+    # Strip the archive extension first: fileS1.safeName takes one extension
+    # off, so a .zip.1 name (the common case here -- .1 is exactly the mark
+    # that a granule was filed) would otherwise yield <granule>.zip.SAFE and
+    # match nothing.
+    stem = stripArchiveExt(os.path.basename(name))
+    try:
+        track, orbit, _, _, _ = fileS1.parseFileName(stem)
+    except Exception:
+        return None
+    safe = fileS1.alreadyDownloaded(assemblyDir, track, orbit,
+                                    fileS1.safeName(stem))
+    return os.path.dirname(safe) if safe else None
+
+
+def duplicateDisposition(archiveDir, assemblyDir, name):
+    '''
+    Decide what to do about a granule whose acquisition is already held under a
+    different product id. Returns (action, held, unitPath); action is None when
+    there is no duplicate at all.
+
+    The rule is how far the held copy has got:
+
+      Not filed, or filed into a unit still to be assembled -> DUP_REPLACE.
+      Nothing downstream has read it yet, so taking the reprocessed product is
+      free and is what ASF meant by reissuing it.
+
+      Filed into a unit already processed -> DUP_NOTE. Swapping it in would mean
+      reprocessing, which has a cost and is a decision for a person. Record it
+      and leave both the unit and the archive alone.
+
+    "Processed" is checkFramesS1.isProcessed -- a Completed marker or an
+    {orbit}-{seq} output dir -- the same test rearmPartialSafes scopes itself
+    with, so the two agree about which units are finished.
+    '''
+    held = duplicateInArchive(archiveDir, name)
+    if held is None:
+        return None, None, None
+    unitPath = heldUnitDir(assemblyDir, held)
+    if unitPath is None:
+        return DUP_REPLACE, held, None
+    trackDir, unitName = os.path.split(unitPath)
+    if checkFramesS1.isProcessed(trackDir, unitName):
+        return DUP_NOTE, held, unitPath
+    return DUP_REPLACE, held, unitPath
+
+
+def retireDuplicate(archiveDir, held, unitPath, check=False):
+    '''
+    Put a superseded copy out of the way: its .SAFE out of the unit directory,
+    its zip into archiveDir/old/.
+
+    Call this only once the replacement has actually downloaded. Retiring first
+    would, on a failed download, leave the acquisition with no copy at all --
+    and the failure here is a night's worth of timeouts, not an exception we
+    could unwind.
+
+    The zip is moved rather than deleted, so the old product stays recoverable
+    and granuleInArchive keeps returning true for it -- which is what stops the
+    retired name being downloaded again on a later pass.
+    '''
+    stem = stripArchiveExt(os.path.basename(held))
+    if unitPath:
+        safeDir = os.path.join(unitPath, f'{stem}.SAFE')
+        if os.path.isdir(safeDir):
+            if check:
+                log.info(f'[check] would remove superseded SAFE {safeDir}')
+            else:
+                shutil.rmtree(safeDir)
+                log.info(f'removed superseded SAFE {safeDir}')
+                # The unit's contents just changed, so a Failed marker left by
+                # an earlier run is no longer evidence about what is there now
+                # -- and while it stands, promoteProblem will not re-route the
+                # unit and the repair never reaches assembly. Clearing it buys
+                # one retry; if the unit still fails, setupTrack writes it back.
+                failed = os.path.join(unitPath, 'Failed')
+                if os.path.exists(failed):
+                    os.remove(failed)
+                    log.info(f'cleared stale Failed marker in {unitPath}')
+    oldDir = os.path.join(archiveDir, 'old')
+    for ext in ('.zip', '.zip.1'):
+        for zipPath in glob.glob(os.path.join(archiveDir, '*', stem + ext)):
+            if os.path.dirname(zipPath) == oldDir:
+                continue
+            if check:
+                log.info(f'[check] would move {zipPath} -> old/')
+                continue
+            os.makedirs(oldDir, exist_ok=True)
+            shutil.move(zipPath,
+                        os.path.join(oldDir, os.path.basename(zipPath)))
+            log.info(f'retired superseded zip '
+                     f'{os.path.basename(zipPath)} -> old/')
+
+
+def noteDuplicate(config, name, held, unitPath, check=False):
+    '''
+    Record a reprocessed product left untaken because the copy already held has
+    been processed.
+
+    Goes to notes.yaml beside the queues rather than into problem.yaml: no queue
+    owns this, because nothing is broken and nothing is waiting. Putting it in
+    problem would make the queue permanently non-empty over a condition no run
+    can clear.
+    '''
+    if check or 'assemblyDir' not in config:
+        return
+    queueDir = queueS1.resolveQueueDir(os.path.abspath(config['assemblyDir']),
+                                       config.get('queueDir'))
+    extra = {'held': held}
+    if unitPath:
+        trackDir, unitName = os.path.split(unitPath)
+        extra['unit'] = f'{os.path.basename(trackDir)}/{unitName}'
+    record = queueS1.noteRecord(
+        name, 'reprocessed product not taken: the copy already held has been '
+        'processed, so taking it would mean reprocessing the unit',
+        'autoupdateS1', base=extra)
+    if queueS1.appendNote(queueDir, record):
+        log.info(f'noted in notes.yaml: {name}')
+
+
+def noteFiledDuplicates(config, archiveDir, check=False):
+    '''
+    Note any unit that already holds more than one product of one acquisition.
+
+    The download path can only catch a duplicate as it arrives, so this covers
+    the ones that landed before there was a check. Nothing else reports them: a
+    processed unit is never re-assembled, so the count mismatch that breaks
+    trimTopsSLCsToFit stays latent until someone reprocesses the unit, and then
+    surfaces as a failure two stages from its cause.
+
+    Driven from the archive rather than by walking the assembly tree. The month
+    directories name every acquisition held, so finding the few with two
+    products costs a readdir apiece, and only those few are then looked up in
+    the tree -- the same reason rearmPartialSafes scopes itself by unit.
+
+    Returns the number of notes written.
+    '''
+    if 'assemblyDir' not in config:
+        return 0
+    assemblyDir = os.path.abspath(config['assemblyDir'])
+    byScene = {}
+    for path in glob.glob(os.path.join(archiveDir, '20*', '*.zip')) + \
+            glob.glob(os.path.join(archiveDir, '20*', '*.zip.1')):
+        scene = sceneKey(os.path.basename(path))
+        if scene:
+            byScene.setdefault(scene, []).append(os.path.basename(path))
+    dupUnits = {}
+    for names in byScene.values():
+        if len(names) < 2:
+            continue
+        filed = {}
+        for name in names:
+            unitPath = heldUnitDir(assemblyDir, name)
+            if unitPath:
+                filed.setdefault(unitPath, []).append(
+                    stripArchiveExt(name))
+        for unitPath, stems in filed.items():
+            if len(stems) > 1:
+                dupUnits.setdefault(unitPath, set()).update(stems)
+    nNoted = 0
+    for unitPath in sorted(dupUnits):
+        trackDir, unitName = os.path.split(unitPath)
+        unit = f'{os.path.basename(trackDir)}/{unitName}'
+        products = sorted(dupUnits[unitPath])
+        log.warning(f'{unit} holds {len(products)} products for '
+                    f'{len(products) // 2} acquisition(s) of the same pass')
+        if check:
+            continue
+        queueDir = queueS1.resolveQueueDir(assemblyDir,
+                                           config.get('queueDir'))
+        record = queueS1.noteRecord(
+            unit, 'holds more than one product of the same acquisition; '
+            'assembly would fail at trimTopsSLCsToFit if the unit were '
+            'reprocessed as it stands', 'autoupdateS1',
+            base={'products': products})
+        if queueS1.appendNote(queueDir, record):
+            nNoted += 1
+    if nNoted:
+        log.info(f'noted {nNoted} unit(s) holding duplicate products')
+    return nNoted
+
+
 def monthDirFor(archiveDir, name):
     '''
     Return archiveDir/<YYYY>-<MM> from the first date token in the granule name,
@@ -621,11 +1023,28 @@ def monthDirFor(archiveDir, name):
 zipComplete = fileS1.zipComplete
 
 
-def downloadOne(url, monthDir, maxAttempts=3):
+def ariaExtraArgs(args):
+    '''
+    The ariaDownload flags this run adds, as a tuple. Empty unless
+    --connections was given, so the nightly behaviour (aria2c -x chosen by
+    time of day) is unchanged by default.
+    '''
+    if getattr(args, 'connections', None) is None:
+        return ()
+    return ('--connections', str(args.connections))
+
+
+def downloadOne(url, monthDir, maxAttempts=3, extraArgs=()):
     '''
     Download a single granule into monthDir via ariaDownload (which adjusts
     aria2c bandwidth by time of day), verifying the zip and re-downloading on
     failure up to maxAttempts. Returns the zip path on success, else None.
+
+    extraArgs are appended to the ariaDownload command. Empty by default, so
+    the nightly behaviour is unchanged; pullASF passes --xferDir <archiveDir>
+    to stop ariaDownload's default scan, whose first entry is '.' (i.e. this
+    month dir) and which would rename an existing <name>.zip.1 back to .zip,
+    un-filing an already-processed granule.
     '''
     os.makedirs(monthDir, exist_ok=True)
     name = os.path.basename(url)
@@ -642,8 +1061,8 @@ def downloadOne(url, monthDir, maxAttempts=3):
                     if os.path.exists(stale):
                         os.remove(stale)
                 log.info(f'ariaDownload attempt {attempt}/{maxAttempts}: {name}')
-                subprocess.run(['ariaDownload', linkFile], cwd=monthDir,
-                               check=True)
+                subprocess.run(['ariaDownload', linkFile, *extraArgs],
+                               cwd=monthDir, check=True)
             if zipComplete(zipPath):
                 return zipPath
             log.warning(f'{name} incomplete/corrupt after attempt {attempt}')
@@ -710,9 +1129,10 @@ class _FilingPipeline:
     _SENTINEL = None
 
     def __init__(self, assemblyDir, filedPath=None, nWorkers=2,
-                 recordEvery=25):
+                 recordEvery=25, excludeTracks=None):
         self.assemblyDir = assemblyDir
         self.filedPath = filedPath
+        self.excludeTracks = set(excludeTracks or [])
         self.nWorkers = max(1, int(nWorkers))
         self.recordEvery = recordEvery
         self.queue = queue.Queue()
@@ -721,6 +1141,10 @@ class _FilingPipeline:
         self.granules = []
         self.nFiled = self.nSkipped = self.nErrors = 0
         self.threads = []
+        # shutdown() is reached from more than one path (downloadStage's own
+        # finally, and runUpdate's ExitStack backstop), so it has to be safe to
+        # call twice -- a second drain would re-write the filed record.
+        self.isShutDown = False
 
     def start(self):
         for i in range(self.nWorkers):
@@ -741,7 +1165,8 @@ class _FilingPipeline:
             name = os.path.basename(zipPath)
             try:
                 status, track, _ = fileS1.fileOneZip(
-                    zipPath, self.assemblyDir, createTrackDir=True)
+                    zipPath, self.assemblyDir, createTrackDir=True,
+                    excludeTracks=self.excludeTracks)
             except Exception as exc:   # never let one zip kill a worker
                 log.exception(f'filing raised for {name}: {exc}')
                 with self.lock:
@@ -777,7 +1202,12 @@ class _FilingPipeline:
         '''
         Drain the queue and join the workers. Every producer (reduce thread)
         must already be joined, so no new work can arrive behind the sentinels.
+
+        Idempotent: see isShutDown in __init__.
         '''
+        if self.isShutDown:
+            return self.nFiled
+        self.isShutDown = True
         pending = self.queue.qsize()
         if pending:
             log.info(f'draining {pending} granule(s) still to file')
@@ -792,15 +1222,85 @@ class _FilingPipeline:
         return self.nFiled
 
 
+def reportInfo(config, configPath):
+    '''
+    Everything worth knowing before touching the pipeline: where the pieces
+    live, whether anything holds a lock, and how much work is outstanding.
+
+    Reads only -- no lock is taken and none is required. The moment this is
+    most wanted is while a run is in progress, so refusing to answer then
+    would defeat the purpose.
+    '''
+    assemblyDir = os.path.abspath(config.get('assemblyDir', ''))
+    queueDir = None
+    if assemblyDir:
+        queueDir = queueS1.resolveQueueDir(assemblyDir,
+                                           config.get('queueDir'),
+                                           migrate=False)
+    projectDir = os.path.dirname(os.path.abspath(configPath))
+    print(f'config       {os.path.abspath(configPath)}')
+    print(f'archiveDir   {config.get("archiveDir")}')
+    print(f'assemblyDir  {assemblyDir or "(unset)"}')
+    print(f'orbitDir     {config.get("orbitDir")}')
+    logDir = config.get('logDir') or os.path.join(projectDir, 'logs')
+    print(f'logDir       {logDir}')
+    excluded = excludedTracks(config)
+    print(f'excluded     {" ".join(str(t) for t in excluded) or "(none)"}')
+    print(f'assemble     {bool(config.get("assemble"))}')
+    if not queueDir or not os.path.isdir(queueDir):
+        print('queueDir     (none yet)')
+        return
+    print(f'queueDir     {queueDir}')
+    for name in (queueS1.LOCK_NAME, queueS1.ASSEMBLY_LOCK_NAME):
+        held, holder, age = queueS1.lockState(queueDir, name)
+        state = f'HELD by {holder} ({age / 3600:.1f} h)' if held else 'free'
+        print(f'{name:<12} {state}')
+    queues = queueS1.readQueues(queueDir)
+    for name in queueS1.QUEUES:
+        print(f'{name:<12} {len(queues[name])}')
+    completed = queueS1._readList(queueS1.completedPath(queueDir))
+    print(f'{"completed":<12} {len(completed)}')
+    processed = queueS1._readList(queueS1.processedPath(queueDir))
+    print(f'{"today":<12} {len(processed)} processed')
+    print(f'\n{QUEUE_NOTE}')
+
+
+def resolveConfigPath(configPath):
+    '''
+    The config to run from.
+
+    An explicit path is taken as given. The default is also looked for via the
+    queue directory's configPath pointer, so the tool can be run from the
+    assembly directory -- where there is no autoupdate.yaml, since the config
+    lives beside the archive on another volume.
+    '''
+    if os.path.exists(configPath):
+        return configPath
+    if configPath != DEFAULT_CONFIG:
+        return configPath        # explicitly named and missing: say so
+    queueDir = queueS1.resolveQueueDir(os.getcwd(), migrate=False)
+    pointer = queueS1.readConfigPath(queueDir)
+    if pointer and os.path.exists(pointer):
+        print(f'autoupdateS1: using {pointer}\n'
+              f'              (recorded in {queueDir}/'
+              f'{queueS1.CONFIG_POINTER})')
+        return pointer
+    return configPath
+
+
 def main():
     ''' Search/download/reduce new S1 IW SLC passes and refresh orbits. '''
     args = parseArgs()
+    args.config = resolveConfigPath(args.config)
     config = loadConfig(args.config)
     if 'archiveDir' not in config:
         u.myerror(f"autoupdateS1: required key 'archiveDir' missing from "
                   f'{args.config}')
     archiveDir = os.path.abspath(config['archiveDir'])
     config['archiveDir'] = archiveDir
+    if args.info:
+        reportInfo(config, args.config)
+        return
     # Session log lives in <projectDir>/logs by default (projectDir is the
     # config file's directory); overridable via the logDir config key.
     projectDir = os.path.dirname(os.path.abspath(args.config))
@@ -814,6 +1314,20 @@ def main():
     log.info(f'=== autoupdateS1 session start (config {args.config}) ===')
     log.info(f'archiveDir {archiveDir}; sensors {",".join(sensors)}; '
              f'log {logPath}')
+    # Note which config drives this queue directory: the two live on different
+    # volumes and nothing else connects them, so standing in the assembly tree
+    # there is otherwise no way back to the config that governs it.
+    if 'assemblyDir' in config and not args.check:
+        queueS1.recordConfigPath(
+            queueS1.resolveQueueDir(config['assemblyDir'],
+                                    config.get('queueDir')),
+            args.config)
+    excluded = excludedTracks(config)
+    if excluded:
+        # Once per run, so an absent track is explained rather than mysterious
+        log.info('tracksToExclude: never downloaded, filed or queued: '
+                 + ' '.join(str(track) for track in excluded))
+        summary.add('excluded tracks', ' '.join(str(t) for t in excluded))
     summary.add('project', projectDir)
     summary.add('archiveDir', archiveDir)
     summary.add('sensors', ','.join(sensors))
@@ -837,12 +1351,19 @@ def main():
         # notifyEmail key nothing is ever mailed. Deliberately not defaulting to
         # root -- /etc/aliases fans root out to other people.
         recipient = config.get('notifyEmail')
+        #
+        # A duplicate product is not an error, but it does mean ASF reprocessed
+        # something and which copy to keep is a decision for a person, so it
+        # is mailed like the rest
+        #
         if recipient and not args.check and (summary.failedUrls
                                              or summary.problems
+                                             or summary.duplicates
                                              or summary.lowDisk or failed):
             subject = sessionSubject(projectDir, socket.gethostname(), failed,
                                      len(summary.failedUrls),
-                                     len(summary.problems), summary.lowDisk)
+                                     len(summary.problems), summary.lowDisk,
+                                     len(summary.duplicates))
             sent = mailReport(recipient, subject, body)
             # Mark only after a confirmed send. An unmarked entry costs a
             # duplicate email next run; a prematurely marked one loses the
@@ -882,7 +1403,8 @@ def fileStage(config, archiveDir, logDir, projectDir, today, check=False,
         tracks, granules = fileS1.fileS1(zipDir=archiveDir,
                                          assemblyDir=assemblyDir,
                                          monthSubdirs=True, filed=filedPath,
-                                         createTrackDir=True, check=check)
+                                         createTrackDir=True, check=check,
+                                         excludeTracks=excludedTracks(config))
         if check:
             log.info(f'[check] would file {len(granules)} zip(s) across tracks '
                      f'{sorted(tracks)}')
@@ -916,15 +1438,16 @@ def frameCheckStage(config, today, args, projectDir, check=False,
                         'skipping')
             return
         orbitDir = config.get('orbitDir', refreshOrbits.DEFAULT_ORBIT_DIR)
-        queueDir = config.get('queueDir', assemblyDir)
+        queueDir = queueS1.resolveQueueDir(
+            assemblyDir, config.get('queueDir'), migrate=not check)
         firstStr, lastStr = resolveDateRange(config, args, today)
         firstDate = datetime.datetime.strptime(firstStr, '%Y-%m-%d')
         lastDate = (datetime.datetime.strptime(lastStr, '%Y-%m-%d')
                     + datetime.timedelta(days=1))
-        entries = checkFramesS1.checkFrames(assemblyDir, orbitDir=orbitDir,
-                                            firstDate=firstDate,
-                                            lastDate=lastDate,
-                                            queueDir=queueDir, check=check)
+        entries = checkFramesS1.checkFrames(
+            assemblyDir, orbitDir=orbitDir, firstDate=firstDate,
+            lastDate=lastDate, queueDir=queueDir, check=check,
+            excludeTracks=excludedTracks(config))
         verb = 'would queue' if check else 'queued'
         log.info(f'frame check: {verb} toProcess {len(entries["toProcess"])}, '
                  f'pending {len(entries["pendingProcessing"])}, '
@@ -933,14 +1456,8 @@ def frameCheckStage(config, today, args, projectDir, check=False,
                     f'toProcess {len(entries["toProcess"])}, '
                     f'pending {len(entries["pendingProcessing"])}, '
                     f'problem {len(entries["problem"])}')
-        # Scan the queue file rather than this run's new entries: it also holds
-        # anything setupTrack routed to problem since the last run, which is
-        # precisely what a within-run diff cannot see.
         if not check:
-            pending = queueS1.unnotified(queueDir)
-            if pending:
-                log.warning(f'{len(pending)} problem unit(s) not yet notified')
-                summary.addProblems(pending, queueDir)
+            sweepProblems(config, check=check)
 
 
 def checkFreeSpace(config):
@@ -973,6 +1490,30 @@ def checkFreeSpace(config):
     return True
 
 
+def sweepProblems(config, check=False):
+    '''
+    Add the problem units that have not been emailed yet to the session summary.
+
+    Scans the queue file rather than this run's new entries, so it also picks up
+    anything setupTrack routed to problem since the last run -- precisely what a
+    within-run diff cannot see.
+
+    Run after *every* stage that can route a unit to problem, not just the frame
+    check.  The assemble stage runs last and creates problem entries of its own:
+    when this lived at the end of frameCheckStage, the 64 units the 2026-08-16
+    cron failed to assemble were swept before they existed, so a completely
+    failed assembly sent no mail at all and the summary read `problem 0`.
+    '''
+    if check or 'assemblyDir' not in config:
+        return
+    queueDir = queueS1.resolveQueueDir(os.path.abspath(config['assemblyDir']),
+                                       config.get('queueDir'))
+    pending = queueS1.unnotified(queueDir)
+    if pending:
+        log.warning(f'{len(pending)} problem unit(s) not yet notified')
+        summary.addProblems(pending, queueDir)
+
+
 def assembleStage(config, args, projectDir, check=False, lockHeld=False):
     '''
     Run the queued units through setupTrack, which reclaims the measurement
@@ -983,7 +1524,8 @@ def assembleStage(config, args, projectDir, check=False, lockHeld=False):
     the dependency circular. setupTrack is on PATH as a console script.
     '''
     assemblyDir = os.path.abspath(config['assemblyDir'])
-    queueDir = os.path.abspath(config.get('queueDir', assemblyDir))
+    queueDir = queueS1.resolveQueueDir(assemblyDir,
+                                       config.get('queueDir'))
     cmd = ['setupTrack.py', '--queue', '--assemblyDir', assemblyDir,
            '--queueDir', queueDir]
     if lockHeld:
@@ -1042,7 +1584,7 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
     # reached, keep going while the next granule is the same pass (orbit +
     # datatake) as the last one downloaded, so a pass is never left half-fetched.
     reduceThreads = []
-    nDownloaded = nSkipped = nFailed = 0
+    nDownloaded = nSkipped = nFailed = nDuplicates = 0
     failedUrls = []
     lastPassKey = None
     try:
@@ -1057,6 +1599,23 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
             if granuleInArchive(archiveDir, name):
                 nSkipped += 1
                 continue
+            action, held, heldUnit = duplicateDisposition(
+                archiveDir, config.get('assemblyDir'), name)
+            if action == DUP_NOTE:
+                #
+                # Not a failure and not an ordinary skip: nothing is wrong with
+                # either copy, but the held one has already been processed, so
+                # taking this one would mean reprocessing the unit
+                #
+                log.warning(f'duplicate product: {name} not downloaded, '
+                            f'{held} already held and processed')
+                noteDuplicate(config, name, held, heldUnit, check=args.check)
+                summary.addDuplicate(name, held)
+                nDuplicates += 1
+                continue
+            if action == DUP_REPLACE:
+                log.info(f'reprocessed product: {name} supersedes {held}, '
+                         'which is not yet processed -- taking the new one')
             monthDir = monthDirFor(archiveDir, name)
             if monthDir is None:
                 log.warning(f'cannot parse date from {name}; skipping')
@@ -1064,10 +1623,13 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
                 continue
             if args.check:
                 log.info(f'[check] would download: {name} -> {monthDir}')
+                if action == DUP_REPLACE:
+                    retireDuplicate(archiveDir, held, heldUnit, check=True)
                 nDownloaded += 1
                 lastPassKey = thisPassKey
                 continue
-            zipPath = downloadOne(url, monthDir, maxAttempts)
+            zipPath = downloadOne(url, monthDir, maxAttempts,
+                                  extraArgs=ariaExtraArgs(args))
             if zipPath is None:
                 nFailed += 1
                 failedUrls.append(url)
@@ -1075,6 +1637,10 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
             nDownloaded += 1
             lastPassKey = thisPassKey
             log.info(f'downloaded: {name} -> {monthDir}')
+            # Only now that the replacement is on disk, and before the reduce
+            # can file it, so the unit never holds both copies at once.
+            if action == DUP_REPLACE:
+                retireDuplicate(archiveDir, held, heldUnit)
             startReduce(zipPath, reducePattern, reduceThreads, pipeline)
 
         # 3b. Retry the failures once at the end of the run. Exhausting all
@@ -1089,7 +1655,8 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
             for url in failedUrls:
                 name = os.path.basename(url)
                 monthDir = monthDirFor(archiveDir, name)
-                zipPath = downloadOne(url, monthDir, maxAttempts)
+                zipPath = downloadOne(url, monthDir, maxAttempts,
+                                      extraArgs=ariaExtraArgs(args))
                 if zipPath is None:
                     log.error(f'still failing after retry pass: {name}')
                     stillFailing.append(url)
@@ -1119,6 +1686,7 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
              f'failed {nFailed}; {len(reduceThreads)} reduced{filedNote}')
     summary.add(verb, nDownloaded)
     summary.add('already in archive', nSkipped)
+    summary.add('duplicate products skipped', nDuplicates)
     summary.add('failed', nFailed)
     if pipeline is not None:
         summary.add('filed while downloading', pipeline.nFiled)
@@ -1141,6 +1709,7 @@ def runUpdate(config, args, archiveDir, sensors, reducePattern, maxAttempts,
     if args.fileData:
         fileStage(config, archiveDir, logDir, projectDir, today,
                   check=args.check)
+        noteFiledDuplicates(config, archiveDir, check=args.check)
         return
 
     # Frame-check-only isolation: skip everything but the vet-and-queue step.
@@ -1153,6 +1722,7 @@ def runUpdate(config, args, archiveDir, sensors, reducePattern, maxAttempts,
     # the assembly lock itself here, since no stage above is holding it.
     if args.assembleOnly:
         assembleStage(config, args, projectDir, check=args.check)
+        sweepProblems(config, check=args.check)
         summary.lowDisk = checkFreeSpace(config)
         return
 
@@ -1197,8 +1767,20 @@ def runUpdate(config, args, archiveDir, sensors, reducePattern, maxAttempts,
             filedPath = os.path.join(logDir, f'filedS1.{today:%m-%d-%Y}.yaml')
             pipeline = _FilingPipeline(
                 os.path.abspath(config['assemblyDir']), filedPath=filedPath,
-                nWorkers=int(config.get('fileWorkers', 2)))
+                nWorkers=int(config.get('fileWorkers', 2)),
+                excludeTracks=excludedTracks(config))
             pipeline.start()
+            # Backstop the drain from the moment the workers exist. They are
+            # not daemons, so any exception between here and downloadStage's
+            # own finally leaves them blocked on queue.get() and the
+            # interpreter hangs at exit -- still holding the cron flock, which
+            # makes every later night exit silently with no log at all. That
+            # is exactly what a searchASF failure did on 2026-08-14: the
+            # session logged, summarised and mailed its failure, then never
+            # exited, and the 15th's run was skipped without a trace.
+            # Registered on the stack (so it runs before the locks release) and
+            # idempotent, since downloadStage still drains it on the happy path.
+            stack.callback(pipeline.shutdown)
         if dlAcquired:
             downloadStage(config, args, archiveDir, sensors, reducePattern,
                           maxAttempts, today, pipeline=pipeline)
@@ -1213,6 +1795,7 @@ def runUpdate(config, args, archiveDir, sensors, reducePattern, maxAttempts,
         if canFile:
             fileStage(config, archiveDir, logDir, projectDir, today,
                       check=args.check, lockHeld=fileAcquired)
+            noteFiledDuplicates(config, archiveDir, check=args.check)
             frameCheckStage(config, today, args, projectDir, check=args.check,
                             lockHeld=fileAcquired)
             # 6. Assemble the queued units. Last, because it needs the queue the
@@ -1220,6 +1803,10 @@ def runUpdate(config, args, archiveDir, sensors, reducePattern, maxAttempts,
             if config.get('assemble') and not args.noAssemble:
                 assembleStage(config, args, projectDir, check=args.check,
                               lockHeld=fileAcquired)
+                # After the assembly, not just after the frame check: this is
+                # the stage that routes a unit to problem for a *setup* failure,
+                # and those are the ones nothing was reporting.
+                sweepProblems(config, check=args.check)
             summary.lowDisk = checkFreeSpace(config)
         else:
             log.info('no assemblyDir in config; skipping file + frame-check '

@@ -20,6 +20,18 @@ import zipfile
 # fileOneZip outcomes.
 FILED, SKIPPED, CHECKED, ERROR = 'filed', 'skipped', 'checked', 'error'
 
+# S1C moved to a different orbital slot around 2026-06-09, which shifted its
+# relative-orbit offset from 171 to 98. A granule's track therefore cannot be
+# derived from its orbit alone -- S1C needs the acquisition date as well.
+#
+# 9 June is still the old slot, so the first date on the new one is the 10th.
+# It is the 10th rather than the 9th plus a comparison, because the acquisition
+# date carries a time: 9 June 10:15 is > datetime(2026, 6, 9) and would take
+# the new constant wrongly. Nothing in fact lands near the boundary -- they
+# collected no data for a couple of weeks over the change.
+s1cShiftDate = datetime(2026, 6, 10)
+s1cConstAfterShift = 98
+
 # Serializes track-/orbit-dir creation. Two frames of one pass share
 # track-<n>/<orbit>, and fileOneZip runs concurrently from both the batch pool
 # here and autoupdateS1's filing pipeline.
@@ -30,7 +42,8 @@ def fileS1Args():
     ''' Handle command line args'''
     parser = argparse.ArgumentParser(
         description='\033[1m File S1 images in Data dir \033[0m',
-        epilog='Notes:  ', allow_abbrev='False')
+        epilog='Part of the asfSearchAndDownload package.',
+        allow_abbrev='False')
     parser.add_argument('--overwrite', action='store_true', default=False,
                         help='Overwrite existing')
     parser.add_argument('--createTrackDir', action='store_true', default=False,
@@ -47,6 +60,12 @@ def fileS1Args():
     parser.add_argument('--filed', type=str, default=None,
                         help='Path to write a YAML record (tracks:/granules:) '
                         'of what was filed this run')
+    parser.add_argument('--excludeTracks', type=str, default='',
+                        metavar='"N N ..."',
+                        help='Tracks never to unpack, as one quoted space- or '
+                        'comma-separated value: --excludeTracks "114 143". '
+                        'Their zips are left where they are, so removing a '
+                        'track from the list files them on the next run')
     parser.add_argument('--check', action='store_true', default=False,
                         help='Dry run: report what would be filed without '
                         'unpacking, renaming, or writing anything')
@@ -54,9 +73,21 @@ def fileS1Args():
     return args
 
 
-def computeTrack(orbit, sat):
+def computeTrack(orbit, sat, date=None):
+    '''
+    Track (relative orbit) from the absolute orbit and satellite.
+
+    Only S1C matters here: it changed orbital slot mid-2026, at absolute orbit
+    8018 (~2026-06-09/10), after which its offset is 98 rather than 171. The
+    shift is keyed on the orbit number (matching upstream ISCE's <=8018 test),
+    so it is correct even when no date is supplied. `date` is retained for
+    backwards compatibility with existing callers.
+    '''
     satConst = {'S1A': 72, 'S1B': 26, 'S1C': 171, 'S1D': 41}
-    track = orbit % 175 - satConst[sat]
+    const = satConst[sat]
+    if sat == 'S1C' and orbit > 8018:
+        const = s1cConstAfterShift
+    track = orbit % 175 - const
     if track < 0:
         track += 175
     return track
@@ -70,7 +101,7 @@ def parseFileName(zipFile):
     date1 = datetime.strptime(date1, '%Y%m%dT%H%M%S')
     date2 = datetime.strptime(date2, '%Y%m%dT%H%M%S')
     orbit = int(orbit)
-    track = computeTrack(orbit, sat)
+    track = computeTrack(orbit, sat, date1)
     return track, orbit, date1, date2, sat
 
 
@@ -169,7 +200,7 @@ def writeFiledRecord(filedFile, tracks, granules, merge=True):
 
 
 def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
-               check=False, timeout=None):
+               check=False, timeout=None, excludeTracks=None, quiet=False):
     ''' Unpack one S1 SAFE zip into assemblyDir/track-<n>/<orbit>/, excluding
     cross-pol, and rename the source to .zip.1 only if the unzip succeeded.
 
@@ -177,6 +208,14 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     raises for an expected failure, and never calls u.myerror -- that is
     sys.exit(), which inside a worker thread kills the thread silently.
     Returns (status, track, zipFile), status one of FILED/SKIPPED/CHECKED/ERROR.
+
+    excludeTracks are never unpacked. The zip is left where it is rather than
+    renamed to .zip.1, so dropping a track from the exclusion files it
+    normally on the next pass.
+
+    quiet passes unzip -q, which drops the per-file 'inflating:' lines and
+    keeps the errors. For a caller unzipping on a background thread while
+    something else writes to the same terminal, those lines are pure noise.
     '''
     zipFile = os.path.abspath(zipFile)
     mySafe = safeName(zipFile)
@@ -185,6 +224,8 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     except Exception:
         u.mywarning(f'cannot parse an S1 granule name from {zipFile}')
         return ERROR, None, zipFile
+    if excludeTracks and track in excludeTracks:
+        return SKIPPED, track, zipFile
     trackDir = f'{assemblyDir}/track-{track}'
     downloaded = alreadyDownloaded(assemblyDir, track, orbit, mySafe)
     # A run that died mid-unzip leaves a partial .SAFE, which alreadyDownloaded
@@ -225,8 +266,8 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     # csh returns the unzip's own status instead of popd's (always 0). That is
     # what lets the rename below be conditional on a good unzip.
     flag = '-o' if (overwrite or refile) else '-u'
-    command = f'unzip {flag} {zipFile} -x "*-slc-hv*"  -x "*-slc-vh*" ' \
-        f'-d {downloadDir}'
+    command = f'unzip {flag} {"-q " if quiet else ""}{zipFile} ' \
+        f'-x "*-slc-hv*"  -x "*-slc-vh*" -d {downloadDir}'
     status = runCommand(command, timeout=timeout)
     # unzip: 0 = ok, 1 = ok with warnings, >= 2 = a real failure.
     safeDir = f'{downloadDir}/{mySafe}'
@@ -250,8 +291,80 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     return FILED, track, zipFile
 
 
+def rearmPartialSafes(zipDir, assemblyDir, monthSubdirs=False, check=False):
+    ''' Rename the .zip.1 of any incomplete .SAFE back to .zip so the normal
+    pass refiles it. Returns the list of (safeDir, zipPath) re-armed.
+
+    fileOneZip() already detects a partial unzip and refiles over it, but only
+    for a granule whose zip is still called .zip -- and the rename to .zip.1 is
+    the durable "this granule is done" marker that drops it from the glob. A
+    .SAFE left incomplete while its zip was already renamed is therefore
+    unreachable by that repair, for ever.
+
+    Not hypothetical: one SAFE (a run killed mid-unzip, under older code that
+    renamed unconditionally rather than gating on unzip status) sat partial in
+    the tree from April to August 2026. Nothing noticed, because the damage
+    surfaces two stages downstream -- runPreProcTops silently produces no
+    SLC_tabs and trimTopsSLCsToFit then fails with a count mismatch that says
+    nothing about which SAFE is bad.
+
+    Scoped to unit directories that are not already processed. A partial .SAFE
+    only matters where the unit still has to be assembled, and skipping the
+    processed ones turns a stat per .SAFE into a stat per unit dir: measured on
+    the Greenland tree, 7 minutes cold over NFS for all 62k .SAFEs against a
+    few seconds this way. Cheap enough to run unconditionally, rather than
+    behind a flag nobody would remember to set.
+
+    "Processed" matches checkFramesS1.isProcessed(): a Completed marker, or an
+    {orbit}-{seq} output dir beside the unit.
+    '''
+    rearmed = []
+    for trackDir in sorted(glob.glob(f'{assemblyDir}/track-*')):
+        # One listing per track, reused for both the unit walk and the
+        # {orbit}-{seq} test. Globbing that test per unit instead re-lists the
+        # track dir every time, which cost more than the whole unscoped scan.
+        try:
+            with os.scandir(trackDir) as entries:
+                names = {e.name for e in entries if e.is_dir()}
+        except OSError:
+            continue
+        for name in sorted(names):
+            orbit, _, seq = name.partition('_')
+            if f'{orbit}-{seq or "0"}' in names:
+                continue                      # has an output dir: processed
+            unitDir = os.path.join(trackDir, name)
+            if os.path.exists(f'{unitDir}/Completed'):
+                continue
+            for safeDir in sorted(glob.glob(f'{unitDir}/*.SAFE')):
+                rearmOneSafe(safeDir, zipDir, monthSubdirs, check, rearmed)
+    return rearmed
+
+
+def rearmOneSafe(safeDir, zipDir, monthSubdirs, check, rearmed):
+    ''' Re-arm one .SAFE if it is a partial unzip. Appends to rearmed. '''
+    if safeLooksComplete(safeDir):
+        return
+    zipName = os.path.basename(safeDir).replace('.SAFE', '.zip')
+    pattern = (f'{zipDir}/*-*/{zipName}' if monthSubdirs
+               else f'{zipDir}/{zipName}')
+    if glob.glob(pattern):
+        return                # still .zip: the normal pass already refiles it
+    filedZips = glob.glob(f'{pattern}.1')
+    if not filedZips:
+        u.mywarning(f'{safeDir} is a partial unzip and its zip is gone; '
+                    're-download that granule to repair it')
+        return
+    zipPath = filedZips[0]
+    u.mywarning(f'{safeDir} is a partial unzip; re-arming '
+                f'{os.path.basename(zipPath)} for refiling')
+    if not check:
+        os.rename(zipPath, zipPath[:-2])
+    rearmed.append((safeDir, zipPath[:-2]))
+
+
 def fileS1(zipDir, assemblyDir='.', monthSubdirs=False, filed=None,
-           overwrite=False, createTrackDir=False, check=False, maxThreads=4):
+           overwrite=False, createTrackDir=False, check=False, maxThreads=4,
+           excludeTracks=None):
     ''' Unpack S1 SAFE zips from zipDir into assemblyDir/track-<n>/<orbit>/.
 
     With monthSubdirs, zips are globbed from zipDir/<YYYY-MM>/*.zip across all
@@ -260,10 +373,18 @@ def fileS1(zipDir, assemblyDir='.', monthSubdirs=False, filed=None,
     (tracks, granules): the set of tracks touched and the list of source zip
     paths filed this run.
 
+    excludeTracks are dropped before anything else, in particular before the
+    missing-track-dir check below: that calls u.myerror, so an excluded track
+    whose directory has been removed would otherwise abort the whole run.
+
     A batch driver over fileOneZip, which autoupdateS1 also calls per granule
     as each download is reduced.
     '''
     assemblyDir = os.path.abspath(assemblyDir)
+    excluded = set(excludeTracks or [])
+    # Before the glob, so anything re-armed is picked up by this same pass.
+    rearmPartialSafes(zipDir, assemblyDir, monthSubdirs=monthSubdirs,
+                      check=check)
     if monthSubdirs:
         zipFiles = glob.glob(f'{zipDir}/*-*/*.zip')
     else:
@@ -277,7 +398,8 @@ def fileS1(zipDir, assemblyDir='.', monthSubdirs=False, filed=None,
     def worker(zipFile):
         status, track, zipFile = fileOneZip(
             zipFile, assemblyDir, overwrite=overwrite,
-            createTrackDir=createTrackDir, check=check)
+            createTrackDir=createTrackDir, check=check,
+            excludeTracks=excluded)
         if status in (FILED, CHECKED):
             with lock:
                 tracks.add(track)
@@ -286,6 +408,13 @@ def fileS1(zipDir, assemblyDir='.', monthSubdirs=False, filed=None,
     for zipFile in zipFiles:
         # Absolute so the per-zip unzip command is cwd-independent.
         zipFile = os.path.abspath(zipFile)
+        if excluded:
+            try:
+                if parseFileName(zipFile)[0] in excluded:
+                    continue
+            except Exception:
+                # Unparseable names are fileOneZip's to report, not ours
+                pass
         # A missing track dir is a hard error for the CLI, as it always was.
         # It has to happen here rather than in fileOneZip: u.myerror is
         # sys.exit(), which a worker thread would swallow.
@@ -315,7 +444,9 @@ def main():
     fileS1(zipDir=args.zipDir, assemblyDir=args.assemblyDir,
            monthSubdirs=args.monthSubdirs, filed=args.filed,
            overwrite=args.overwrite, createTrackDir=args.createTrackDir,
-           check=args.check)
+           check=args.check,
+           excludeTracks=[int(x) for x in
+                          args.excludeTracks.replace(',', ' ').split()])
 
 
 if __name__ == '__main__':
