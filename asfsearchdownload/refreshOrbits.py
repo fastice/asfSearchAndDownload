@@ -18,7 +18,6 @@ from datetime import datetime
 from html.parser import HTMLParser
 
 import requests
-import utilities as u
 
 POEORB_URL = 'https://s1qc.asf.alaska.edu/aux_poeorb/'
 DEFAULT_ORBIT_DIR = '/Volumes/insar9/ian/Data/SentinelGreenland/OPOD'

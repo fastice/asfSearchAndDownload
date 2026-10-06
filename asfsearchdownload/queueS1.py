@@ -12,9 +12,8 @@ package) works through toProcess and reports failures back into problem.
   pendingProcessing.yaml  vetted, waiting on the precise (EOF) orbit
   problem.yaml            gap / over-length / out-of-range / failed assembly
 
-This module deliberately imports nothing heavy -- no utilities, no gdal, no
-requests -- so setupTrack can read the queues without paying checkFramesS1's
-~2.5 s import cost.
+This module deliberately imports nothing heavy -- no gdal, no requests -- so
+setupTrack can read the queues cheaply.
 
 Record schema. Every entry carries at least a 'unit' (e.g. 'track-90/7086',
 relative to assemblyDir). Entries queued before a unit's frame extent is known

@@ -44,6 +44,8 @@ import h5py
 import numpy as np
 import requests
 
+from asfsearchdownload.helpers import myerror
+
 # Exit codes, sysexits range, same contract as pullASF.
 OK = 0
 BADNAME = 65
@@ -110,16 +112,6 @@ PRODUCTS = {
         'shared': 'rtcGammaToSigmaFactor',
     },
 }
-
-
-def myerror(message):
-    '''Print and exit 1.
-
-    Deliberately not utilities.myerror, which exits 0 - a caller using
-    subprocess.run(check=True) would read a fatal error as success.
-    '''
-    print(f'\n\033[1;31m{message}\033[0m\n', flush=True)
-    sys.exit(1)
 
 
 def downloadNISARoptimizedArgs():

@@ -56,9 +56,9 @@ to `toProcess` by itself on the next `autoupdateS1 --checkFrames`.
 
 ## Library API
 
-The module deliberately imports nothing heavy (no `utilities`, gdal or
-requests): `import queueS1` costs ~0.04 s against ~2.3 s for `checkFramesS1`,
-which is what lets `s1setup` depend on it cheaply. Keep it that way.
+The module deliberately imports nothing heavy (no gdal or requests):
+`import queueS1` costs ~0.03 s, which is what lets `s1setup` depend on it
+cheaply. Keep it that way.
 
 - `applyQueueDeltas(queueDir, add=, remove=, update=)` — locked
   read-modify-write, applied per queue as remove → add → update, so one call can

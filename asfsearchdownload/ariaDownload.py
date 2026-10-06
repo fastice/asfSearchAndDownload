@@ -12,16 +12,7 @@ from subprocess import call
 import shutil
 from datetime import datetime
 
-
-def myerror(message):
-    """ print error and exit with a FAILING status (1).
-
-    Local copy of utilities.myerror; was a bare sys.exit() (status 0), which
-    made the subprocess.run(..., check=True) callers in autoupdate.py /
-    autoupdateS1.py treat a failed download as success.
-    """
-    print(f'\n\t\033[1;31m *** {message} *** \033[0m\n')
-    sys.exit(1)
+from asfsearchdownload.helpers import myerror
 
 
 def ariaArgs():

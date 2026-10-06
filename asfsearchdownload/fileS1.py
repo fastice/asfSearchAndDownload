@@ -7,7 +7,7 @@ Created on Fri Jun 18 15:11:35 2021
 """
 
 import argparse
-import utilities as u
+from asfsearchdownload import helpers
 import os
 from datetime import datetime
 from subprocess import call
@@ -170,7 +170,7 @@ def runCommand(command, timeout=None):
                     timeout=timeout)
     except Exception:
         # if missing files, reject to the NoResult directory
-        u.mywarning(f'could not run \n{command}')
+        helpers.mywarning(f'could not run \n{command}')
         return -1
 
 
@@ -190,7 +190,7 @@ def writeFiledRecord(filedFile, tracks, granules, merge=True):
             tracks = set(tracks) | set(old.get('tracks') or [])
             granules = set(granules) | set(old.get('granules') or [])
         except Exception as exc:
-            u.mywarning(f'could not merge existing {filedFile}: {exc}')
+            helpers.mywarning(f'could not merge existing {filedFile}: {exc}')
     record = {'tracks': sorted(tracks),
               'granules': sorted(granules)}
     tmpFile = f'{filedFile}.tmp'
@@ -205,7 +205,7 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     cross-pol, and rename the source to .zip.1 only if the unzip succeeded.
 
     Thread safe: callable concurrently on granules of the same pass. Never
-    raises for an expected failure, and never calls u.myerror -- that is
+    raises for an expected failure, and never calls helpers.myerror -- that is
     sys.exit(), which inside a worker thread kills the thread silently.
     Returns (status, track, zipFile), status one of FILED/SKIPPED/CHECKED/ERROR.
 
@@ -222,7 +222,7 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     try:
         track, orbit, date1, date2, sat = parseFileName(zipFile)
     except Exception:
-        u.mywarning(f'cannot parse an S1 granule name from {zipFile}')
+        helpers.mywarning(f'cannot parse an S1 granule name from {zipFile}')
         return ERROR, None, zipFile
     if excludeTracks and track in excludeTracks:
         return SKIPPED, track, zipFile
@@ -233,7 +233,7 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     # ever (the gated rename below means its .zip is still here to refile from).
     refile = downloaded is not None and not safeLooksComplete(downloaded)
     if refile:
-        u.mywarning(f'{downloaded} looks like a partial unzip; refiling')
+        helpers.mywarning(f'{downloaded} looks like a partial unzip; refiling')
     if downloaded is not None and not overwrite and not refile:
         return SKIPPED, track, zipFile
     if check:
@@ -243,14 +243,14 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     # Never unzip a download that is still in flight or truncated: fileStage can
     # run while another invocation is downloading into the same archiveDir.
     if not zipComplete(zipFile):
-        u.mywarning(f'{os.path.basename(zipFile)} is incomplete or not a valid '
+        helpers.mywarning(f'{os.path.basename(zipFile)} is incomplete or not a valid '
                     'zip; leaving it for a later pass')
         return SKIPPED, track, zipFile
     try:
         with _dirLock:
             if not os.path.exists(trackDir):
                 if not createTrackDir:
-                    u.mywarning(f'{trackDir} does not exist, rerun with '
+                    helpers.mywarning(f'{trackDir} does not exist, rerun with '
                                 '--createTrackDir to create')
                     return ERROR, track, zipFile
                 os.makedirs(trackDir, exist_ok=True)
@@ -260,7 +260,7 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
             else:
                 downloadDir = os.path.dirname(downloaded)
     except OSError as exc:
-        u.mywarning(f'could not create the assembly dir for {zipFile}: {exc}')
+        helpers.mywarning(f'could not create the assembly dir for {zipFile}: {exc}')
         return ERROR, track, zipFile
     # `unzip -d <dir>` rather than the old `pushd <dir>; unzip -d ./; popd`, so
     # csh returns the unzip's own status instead of popd's (always 0). That is
@@ -272,11 +272,11 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     # unzip: 0 = ok, 1 = ok with warnings, >= 2 = a real failure.
     safeDir = f'{downloadDir}/{mySafe}'
     if status not in (0, 1) or not os.path.isdir(safeDir):
-        u.mywarning(f'unzip failed (status {status}) for {zipFile}; leaving it '
+        helpers.mywarning(f'unzip failed (status {status}) for {zipFile}; leaving it '
                     'as .zip to retry on a later pass')
         return ERROR, track, zipFile
     if status == 1:
-        u.mywarning(f'unzip completed with warnings for {zipFile}')
+        helpers.mywarning(f'unzip completed with warnings for {zipFile}')
     if overwrite:
         for parFile in glob.glob(
                 f'{downloadDir}/{date1.strftime("%Y%m%d")}*par'):
@@ -286,7 +286,7 @@ def fileOneZip(zipFile, assemblyDir, overwrite=False, createTrackDir=False,
     try:
         os.rename(zipFile, filedName(zipFile))
     except OSError as exc:
-        u.mywarning(f'unzipped but could not rename {zipFile}: {exc}')
+        helpers.mywarning(f'unzipped but could not rename {zipFile}: {exc}')
         return ERROR, track, zipFile
     return FILED, track, zipFile
 
@@ -351,11 +351,11 @@ def rearmOneSafe(safeDir, zipDir, monthSubdirs, check, rearmed):
         return                # still .zip: the normal pass already refiles it
     filedZips = glob.glob(f'{pattern}.1')
     if not filedZips:
-        u.mywarning(f'{safeDir} is a partial unzip and its zip is gone; '
+        helpers.mywarning(f'{safeDir} is a partial unzip and its zip is gone; '
                     're-download that granule to repair it')
         return
     zipPath = filedZips[0]
-    u.mywarning(f'{safeDir} is a partial unzip; re-arming '
+    helpers.mywarning(f'{safeDir} is a partial unzip; re-arming '
                 f'{os.path.basename(zipPath)} for refiling')
     if not check:
         os.rename(zipPath, zipPath[:-2])
@@ -374,7 +374,7 @@ def fileS1(zipDir, assemblyDir='.', monthSubdirs=False, filed=None,
     paths filed this run.
 
     excludeTracks are dropped before anything else, in particular before the
-    missing-track-dir check below: that calls u.myerror, so an excluded track
+    missing-track-dir check below: that calls helpers.myerror, so an excluded track
     whose directory has been removed would otherwise abort the whole run.
 
     A batch driver over fileOneZip, which autoupdateS1 also calls per granule
@@ -416,13 +416,13 @@ def fileS1(zipDir, assemblyDir='.', monthSubdirs=False, filed=None,
                 # Unparseable names are fileOneZip's to report, not ours
                 pass
         # A missing track dir is a hard error for the CLI, as it always was.
-        # It has to happen here rather than in fileOneZip: u.myerror is
+        # It has to happen here rather than in fileOneZip: helpers.myerror is
         # sys.exit(), which a worker thread would swallow.
         if not check and not createTrackDir:
             track = parseFileName(zipFile)[0]
             trackDir = f'{assemblyDir}/track-{track}'
             if not os.path.exists(trackDir):
-                u.myerror(f'{trackDir} does not exist, rerun with '
+                helpers.myerror(f'{trackDir} does not exist, rerun with '
                           '--createTrackDir to create')
         if check:
             # Single threaded so the reported order stays deterministic.
@@ -431,7 +431,7 @@ def fileS1(zipDir, assemblyDir='.', monthSubdirs=False, filed=None,
             threads.append(threading.Thread(target=worker, args=[zipFile]))
 
     if not check:
-        u.runMyThreads(threads, maxThreads, 'unzip data')
+        helpers.runMyThreads(threads, maxThreads, 'unzip data')
     if filed is not None and not check:
         writeFiledRecord(filed, tracks, granules)
     return tracks, granules

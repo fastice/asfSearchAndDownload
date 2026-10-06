@@ -26,7 +26,7 @@ import re
 import shutil
 from datetime import datetime, timedelta
 
-import utilities as u
+from asfsearchdownload import helpers
 
 from asfsearchdownload import refreshOrbits
 from asfsearchdownload import queueS1
@@ -496,7 +496,7 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
             name = f'track-{name}'
         trackDirs = [os.path.join(assemblyDir, name)]
         if not os.path.isdir(trackDirs[0]):
-            u.myerror(f'checkFramesS1: no such track dir {trackDirs[0]}')
+            helpers.myerror(f'checkFramesS1: no such track dir {trackDirs[0]}')
     else:
         trackDirs = sorted(glob.glob(os.path.join(assemblyDir, 'track-*')))
         if excluded:
@@ -626,7 +626,7 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
         # and setupTrack may have consumed entries since, which a snapshot write
         # would silently undo.
         if queueS1.applyQueueDeltas(queueDir, **deltas) is None:
-            u.mywarning('checkFramesS1: another writer holds the queue lock; '
+            helpers.mywarning('checkFramesS1: another writer holds the queue lock; '
                         'no queue changes were written')
     total = sum(len(v) for v in newEntries.values())
     verb = 'would queue' if check else 'queued'

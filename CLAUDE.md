@@ -15,6 +15,7 @@ Search the ASF DAAC for NISAR / Sentinel-1 products, dedupe against a local arch
 | `checkFramesS1` | `checkFramesS1.py:main()` | Vet filed datatakes (burst "frames"), restructure, and queue → toProcess/pending/problem |
 | `downloadNISARoptimized` | `downloadNISARoptimized.py:main()` | Fetch NISAR products keeping only the datasets the GrIMP tools read, as float16, with a shared RTC factor |
 | `downloadRSLCSubset` | `downloadRSLCSubset.py:main()` | Fetch a spatial subset of a NISAR RSLC as a slim RSLC with cropped, self-consistent geometry |
+| `helpers` | `helpers.py` | Library only — `myerror`/`mywarning`/`myalert`/`runMyThreads`, copied from `utilities` so the package does not depend on it |
 | `writeSearchGpkg` | `writeSearchGpkg.py` | Library only (no CLI) — used by `searchASF --gpkg` |
 
 ## Workflow
@@ -132,7 +133,7 @@ Stages in `runUpdate()` (each is skippable/isolatable):
 
 ## fileS1
 
-Globs `zipDir/<YYYY-MM>/*.zip` (`--monthSubdirs`, all months) — or flat `zipDir/*.zip` — and `unzip -u`s each SAFE into `assemblyDir/track-<n>/<orbit>/` (track from `orbit % 175 − satConst[sat]`), **excluding** cross-pol (`*-slc-hv*`/`*-slc-vh*`), then renames the source `.zip` → `.zip.1`. `--filed <yaml>` is an **output** (`tracks:`/`granules:` filed this run). `--assemblyDir` defaults `.`; `--createTrackDir` makes missing `track-<n>`. `--check` reports without moving. (Moved here from `s1setup`/`insarScripts`; `utilities` provides `runMyThreads`.)
+Globs `zipDir/<YYYY-MM>/*.zip` (`--monthSubdirs`, all months) — or flat `zipDir/*.zip` — and `unzip -u`s each SAFE into `assemblyDir/track-<n>/<orbit>/` (track from `orbit % 175 − satConst[sat]`), **excluding** cross-pol (`*-slc-hv*`/`*-slc-vh*`), then renames the source `.zip` → `.zip.1`. `--filed <yaml>` is an **output** (`tracks:`/`granules:` filed this run). `--assemblyDir` defaults `.`; `--createTrackDir` makes missing `track-<n>`. `--check` reports without moving. (Moved here from `s1setup`/`insarScripts`; `helpers` provides `runMyThreads`.)
 
 - **`fileOneZip(zipFile, assemblyDir, …)`** is the per-zip entry point; `fileS1()` is a batch driver over it and `autoupdateS1`'s pipeline calls it per granule. Returns `(status, track, zipFile)`, status `FILED`/`SKIPPED`/`CHECKED`/`ERROR`. **Never raises and never calls `u.myerror`** — that is `sys.exit()`, which a worker thread swallows silently, so the CLI's hard-error-on-missing-track-dir stays in the `fileS1()` driver on the main thread.
 - **The `-x` cross-pol exclusions are load-bearing, not redundant with the reduce.** `remove_files_from_zip` matches the plain substring `reducePattern` (default `hv`), so `'hv' in 's1c-iw1-slc-vh-…'` is False and **the reduce is a no-op on VV/VH scenes** — only `unzip -x` strips their cross-pol. Verified on a real `1SDV` granule. Do not "simplify" these away.
@@ -143,7 +144,7 @@ Globs `zipDir/<YYYY-MM>/*.zip` (`--monthSubdirs`, all months) — or flat `zipDi
 
 ## queueS1
 
-The queue-file contract, shared with `s1setup.setupTrack`. **Imports nothing heavy on purpose** — `import checkFramesS1` costs ~2.3 s (utilities→gdal/scipy, refreshOrbits→requests), `import queueS1` costs ~0.04 s. That is what makes the `s1setup → asfSearchAndDownload` dependency acceptable; don't add heavy imports here.
+The queue-file contract, shared with `s1setup.setupTrack`. **Imports nothing heavy on purpose** — `import queueS1` costs ~0.03 s (`checkFramesS1` ~0.13 s, `autoupdateS1` ~0.27 s, mostly requests/yaml). That is what makes the `s1setup → asfSearchAndDownload` dependency acceptable; don't add heavy imports here.
 
 - `applyQueueDeltas(queueDir, add=, remove=, update=)` — locked read-modify-write, applied per queue as **remove → add → update** (so one call can move a unit between queues). **Use this, not `writeQueues`**: a full rewrite from a stale snapshot silently undoes a concurrent writer, and `checkFrames` reads its queues minutes before it writes them. `update` with a value of `None` deletes the key. Add is first-wins, so a re-add never resets `notified`.
 - `queueLock` — `O_EXCL`, 30 s wait, 15 min stale reclaim. `_atomicDump` writes temp + `os.replace` (atomic on NFSv4) and skips unchanged files so mtimes stay meaningful.

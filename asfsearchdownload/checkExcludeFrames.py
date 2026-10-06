@@ -31,7 +31,7 @@ import sys
 
 import geopandas as gpd
 
-import utilities as u
+from asfsearchdownload import helpers
 
 
 def checkExcludeFramesArgs():
@@ -57,7 +57,7 @@ def granuleFrames(gpkgDir):
         try:
             table = gpd.read_file(path)
         except Exception as exc:
-            u.mywarning(f'could not read {path}: {exc}')
+            helpers.mywarning(f'could not read {path}: {exc}')
             continue
         if 'granule' not in table.columns:
             continue
@@ -114,7 +114,7 @@ def main():
     assemblyDir, gpkgDir, wanted = checkExcludeFramesArgs()
     known = granuleFrames(gpkgDir)
     if not known:
-        u.myerror(f'no granule/track/frame records found in {gpkgDir}/*.gpkg')
+        helpers.myerror(f'no granule/track/frame records found in {gpkgDir}/*.gpkg')
     print(f'{len(known)} granules resolvable from {gpkgDir}\n')
 
     nClash = 0

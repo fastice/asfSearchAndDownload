@@ -42,7 +42,7 @@ import threading
 import time
 
 import yaml
-import utilities as u
+from asfsearchdownload import helpers
 
 from asfsearchdownload import refreshOrbits
 from asfsearchdownload import fileS1
@@ -468,7 +468,7 @@ def regionFlag(region):
     '''
     key = str(region).strip().lower()
     if key not in regionFlags:
-        u.myerror(f"autoupdateS1: region must be one of {list(regionFlags)}, "
+        helpers.myerror(f"autoupdateS1: region must be one of {list(regionFlags)}, "
                   f"got '{region}'")
     return regionFlags[key]
 
@@ -486,7 +486,7 @@ def spatialFlags(config, args):
         return ['--searchArea', str(config['searchArea'])]
     if config.get('region'):
         return [regionFlag(config['region'])]
-    u.myerror('autoupdateS1: no region or searchArea given (CLI flag or '
+    helpers.myerror('autoupdateS1: no region or searchArea given (CLI flag or '
               'config key)')
 
 
@@ -538,7 +538,7 @@ def excludedFramesSpec(config):
                     line = line.split('#')[0]
                     frames += [int(f) for f in line.replace(',', ' ').split()]
         except (OSError, ValueError) as exc:
-            u.mywarning(f'ignoring {path}: {exc}')
+            helpers.mywarning(f'ignoring {path}: {exc}')
             continue
         if frames:
             groups.append(f'{track}:{",".join(str(f) for f in sorted(set(frames)))}')
@@ -558,7 +558,7 @@ def excludedTracks(config):
         try:
             tracks.append(int(token))
         except ValueError:
-            u.myerror(f'autoupdateS1: tracksToExclude wants track numbers, '
+            helpers.myerror(f'autoupdateS1: tracksToExclude wants track numbers, '
                       f'got {token!r}')
     return sorted(set(tracks))
 
@@ -576,7 +576,7 @@ def resolveSensors(config, args):
     sats = configList(config.get('satellites'), '')
     unknown = [s for s in sats if s not in refreshOrbits.ALL_SENSORS]
     if unknown:
-        u.myerror(f'autoupdateS1: unknown satellite(s) {unknown} in config '
+        helpers.myerror(f'autoupdateS1: unknown satellite(s) {unknown} in config '
                   f'satellites; choose from {list(refreshOrbits.ALL_SENSORS)}')
     return tuple(s for s in refreshOrbits.ALL_SENSORS if s in sats)
 
@@ -594,7 +594,7 @@ def directionFlags(config):
         return ['--flightDirection', 'ASCENDING']
     if direction.startswith('desc'):
         return ['--flightDirection', 'DESCENDING']
-    u.myerror("autoupdateS1: direction must be both/ascending/descending, got "
+    helpers.myerror("autoupdateS1: direction must be both/ascending/descending, got "
               f"'{direction}'")
 
 
@@ -1294,7 +1294,7 @@ def main():
     args.config = resolveConfigPath(args.config)
     config = loadConfig(args.config)
     if 'archiveDir' not in config:
-        u.myerror(f"autoupdateS1: required key 'archiveDir' missing from "
+        helpers.myerror(f"autoupdateS1: required key 'archiveDir' missing from "
                   f'{args.config}')
     archiveDir = os.path.abspath(config['archiveDir'])
     config['archiveDir'] = archiveDir
@@ -1387,7 +1387,7 @@ def fileStage(config, archiveDir, logDir, projectDir, today, check=False,
     assembly tree at once.
     '''
     if 'assemblyDir' not in config:
-        u.myerror("autoupdateS1: the file stage needs the 'assemblyDir' key "
+        helpers.myerror("autoupdateS1: the file stage needs the 'assemblyDir' key "
                   'in the config')
     assemblyDir = os.path.abspath(config['assemblyDir'])
     lockPath = assemblyLockPath(config)
@@ -1427,7 +1427,7 @@ def frameCheckStage(config, today, args, projectDir, check=False,
     so two machines must never run either at once on the same project.
     '''
     if 'assemblyDir' not in config:
-        u.myerror("autoupdateS1: the frame-check stage needs the 'assemblyDir' "
+        helpers.myerror("autoupdateS1: the frame-check stage needs the 'assemblyDir' "
                   'key in the config')
     assemblyDir = os.path.abspath(config['assemblyDir'])
     lockPath = assemblyLockPath(config)
