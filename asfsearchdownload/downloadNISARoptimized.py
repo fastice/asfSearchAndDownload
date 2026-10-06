@@ -33,9 +33,10 @@ import glob
 import hashlib
 import json
 import os
+import socket
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 import aiohttp
 import fsspec
@@ -49,6 +50,18 @@ BADNAME = 65
 FETCHFAIL = 68
 VERIFYFAIL = 69
 NOOUTPUT = 64
+
+# Scratch. A sparse file's apparent size is the whole product but only the fetched pages are
+# written: up to ~3.3 GB on a first cycle of a 5 GB product, ~1.1 GB once the factor is shared.
+# At most repackWorkers + 1 are on disk at once (main() holds the fetch back while the repacks
+# catch up).
+SHM_DIR = '/dev/shm'
+SCRATCH_GB_PER_GRANULE = 4.0
+# tmpfs pages are RAM, so /dev/shm is only used if this much is left over for the repacks.
+SHM_MEM_RESERVE_GB = 4.0
+# A scratch name without the pid@host tag comes from a version before the tag existed; only
+# its age can show that the run which wrote it is dead.
+UNTAGGED_STALE_SECONDS = 86400
 
 # Attributes that carry HDF5 object references into the destination file. Copying them
 # verbatim leaves pointers to datasets that either do not exist or now sit at a different
@@ -136,8 +149,9 @@ def downloadNISARoptimizedArgs():
                         help='MB/s cap, 0 for none [19]')
     parser.add_argument('--repackWorkers', type=int, default=3,
                         help='repack processes overlapping the next download [3]')
-    parser.add_argument('--tmpDir', type=str, default='/dev/shm',
-                        help='where the sparse scratch file goes [/dev/shm]')
+    parser.add_argument('--tmpDir', type=str, default=None,
+                        help='where the sparse scratch files go [/dev/shm if it and free '
+                             'RAM are big enough, else <outputDir>/.scratch]')
     parser.add_argument('--maxGranules', type=int, default=0,
                         help='stop after this many, 0 for all [0]')
     parser.add_argument('--check', action='store_true',
@@ -484,6 +498,106 @@ def verifySlim(outPath, factorPath, desc, polarization, frequency):
     return problems
 
 
+def scratchPath(tmpDir, stem):
+    '''Sparse scratch file for one granule, tagged with this run's pid and host so the
+    startup sweep can tell a leaked file from one another run is still using.'''
+    return os.path.join(tmpDir, f'{stem}.{os.getpid()}@{socket.gethostname()}.sparse')
+
+
+def pidAlive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def sweepLeakedScratch(tmpDir):
+    '''Remove scratch files whose run is dead and return how many.
+
+    A SIGKILL skips the finally that removes a scratch file, so every interrupted run leaves
+    one behind, and they accumulated until tmpDir was full. A file is only removed when its
+    writer is known to be gone: a dead pid on this host, or an untagged name older than
+    UNTAGGED_STALE_SECONDS. Anything else may belong to a concurrent run (or to
+    downloadRSLCSubset, whose scratch matches the same glob).
+    '''
+    host = socket.gethostname()
+    removed = 0
+    for f in glob.glob(os.path.join(tmpDir, 'NISAR_*.sparse')):
+        base = os.path.basename(f)[:-len('.sparse')]
+        try:
+            if '@' in base:
+                stemPid, fileHost = base.rsplit('@', 1)
+                pid = stemPid.rsplit('.', 1)[-1]
+                if fileHost != host or not pid.isdigit() or pidAlive(int(pid)):
+                    continue
+            elif time.time() - os.path.getmtime(f) < UNTAGGED_STALE_SECONDS:
+                continue
+            os.remove(f)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def freeGb(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize / 1e9
+
+
+def memAvailableGb():
+    '''MemAvailable from /proc/meminfo in GB, or None where there is none (macOS).'''
+    try:
+        with open('/proc/meminfo') as fp:
+            for line in fp:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024 / 1e9
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def chooseTmpDir(args):
+    '''Return the scratch directory, sweeping leaked files out of it first.
+
+    An explicit --tmpDir is used as given. Otherwise /dev/shm is used when both its free space
+    and the free RAM cover the in-flight scratch - tmpfs pages are RAM, and its free space is
+    only a cap (half of RAM by default), so on a small machine filling it pushes the repacks
+    into swap - and <outputDir>/.scratch on disk when not, which is the laptop case (macOS has
+    no /dev/shm at all).
+    '''
+    needGb = (args.repackWorkers + 1) * SCRATCH_GB_PER_GRANULE
+    candidates = []
+    if args.tmpDir is not None:
+        candidates.append(args.tmpDir)
+    else:
+        if os.path.isdir(SHM_DIR):
+            candidates.append(SHM_DIR)
+        candidates.append(os.path.join(args.outputDir, '.scratch'))
+    for tmpDir in candidates:
+        os.makedirs(tmpDir, exist_ok=True)
+        nSwept = sweepLeakedScratch(tmpDir)
+        if nSwept:
+            print('removed %d leaked scratch file(s) from %s' % (nSwept, tmpDir), flush=True)
+        free = freeGb(tmpDir)
+        if tmpDir == SHM_DIR and args.tmpDir is None:
+            mem = memAvailableGb()
+            if free < needGb or (mem is not None and mem < needGb + SHM_MEM_RESERVE_GB):
+                print('%s too small (%.1f GB free, %s GB RAM available, need %.1f + %.1f '
+                      'reserve); using disk scratch' % (
+                          tmpDir, free, 'unknown' if mem is None else '%.1f' % mem,
+                          needGb, SHM_MEM_RESERVE_GB), flush=True)
+                continue
+        if free < needGb:
+            myerror('downloadNISARoptimized: only %.1f GB free in %s, need %.1f GB for %d '
+                    'granules in flight; point --tmpDir somewhere larger or lower '
+                    '--repackWorkers' % (free, tmpDir, needGb, args.repackWorkers + 1))
+        print('scratch %s (%.1f GB free)' % (tmpDir, free), flush=True)
+        return tmpDir
+
+
 def fetchOne(url, args, desc, session, claimed):
     '''Resolve, plan and fetch one granule into a sparse scratch file.
 
@@ -541,7 +655,7 @@ def fetchOne(url, args, desc, session, claimed):
         '' if needFactor else ' (factor reused)'), flush=True)
     if args.check:
         return None
-    sparse = os.path.join(args.tmpDir, stem + '.sparse')
+    sparse = scratchPath(args.tmpDir, stem)
     if os.path.exists(sparse):
         os.remove(sparse)
     # MUST be the full product size. HDF5 records the expected EOF in the superblock, so a
@@ -656,27 +770,8 @@ def main():
         args.factorDir = os.path.join(args.outputDir, 'factors')
     os.makedirs(args.outputDir, exist_ok=True)
     os.makedirs(args.factorDir, exist_ok=True)
-    # Sweep leaked scratch files. A SIGKILL skips the finally that removes them, so every
-    # interrupted run leaves one behind; they accumulated until tmpDir was full.
     if not args.local:
-        leaked = glob.glob(os.path.join(args.tmpDir, 'NISAR_*.sparse'))
-        alive = {os.path.join(args.tmpDir, granuleStem(u) + '.sparse') for u in
-                 [x.strip() for x in open(args.urls) if x.strip()]}
-        stale = [f for f in leaked if f in alive or True]
-        for f in stale:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-        if stale:
-            print('removed %d leaked scratch file(s) from %s' % (len(stale), args.tmpDir),
-                  flush=True)
-        free = os.statvfs(args.tmpDir)
-        freeGb = free.f_bavail * free.f_frsize / 1e9
-        print('%s has %.1f GB free' % (args.tmpDir, freeGb), flush=True)
-        if freeGb < 20:
-            myerror('downloadNISARoptimized: only %.1f GB free in %s - the scratch files need '
-                    'room; point --tmpDir somewhere larger' % (freeGb, args.tmpDir))
+        args.tmpDir = chooseTmpDir(args)
     urls = [u.strip() for u in open(args.urls) if u.strip()]
     if args.local:
         bad = [u for u in urls
@@ -708,6 +803,10 @@ def main():
                 continue
             if job is not None:
                 pending.append(pool.submit(repackOne, job, args, desc))
+            if len(pending) > args.repackWorkers:
+                # Hold the next fetch until a repack finishes, so the scratch on disk stays
+                # within what chooseTmpDir checked for instead of growing with the backlog.
+                wait(pending, return_when=FIRST_COMPLETED)
             for f in [p for p in pending if p.done()]:
                 pending.remove(f)
                 stem, nbytes, problems, clamped = f.result()
