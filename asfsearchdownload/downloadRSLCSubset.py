@@ -58,6 +58,7 @@ import fsspec
 import h5py
 import numpy as np
 import requests
+from asfsearchdownload.networkLog import logTransfer, now
 
 OK = 0
 FETCHFAIL = 68
@@ -585,8 +586,11 @@ def doOne(url, args, session):
     os.truncate(fd, job['size'])
     os.close(fd)
     t1 = time.time()
+    start = now()
     got = asyncio.run(fetchRuns(signed, runs, sparse, args.connections,
                                 args.limit * 1e6 if args.limit else 0))
+    logTransfer('downloadRSLCSubset', stem, got, start, now(),
+                connections=args.connections)
     print(f'    fetched {got/1e9:.3f} GB in {time.time()-t1:.0f} s '
           f'({got/max(1e-6, time.time()-t1)/1e6:.1f} MB/s)', flush=True)
     job['sparse'] = sparse

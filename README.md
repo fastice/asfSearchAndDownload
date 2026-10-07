@@ -20,6 +20,10 @@ pip install git+https://github.com/fastice/asfSearchAndDownload.git@main
 
 **pullASF** fetches a pair's Sentinel-1 granules into the archive (download, then cross-pol reduce), allowing one download at a time across all hosts, with an exit-code contract so a failed fetch can short-circuit the processing step that follows it in a queue line. [Documentation](Documents/pullASF.md)
 
+### Network usage logging
+
+**logNetworkUse / networkMonitor** document network usage per machine in `~/networkLogs/` (shared home). Every download made through ariaDownload, refreshS1Orbits, downloadNISARoptimized or downloadRSLCSubset appends start/end/MB/MB/s to `networkLog.<host>`; networkMonitor, run from cron each minute, logs the whole host's internet-interface traffic to `interfaceLog.<host>`. [Documentation](Documents/networkLog.md)
+
 ### NISAR slim downloads
 
 **downloadNISARoptimized** fetches NISAR GCOV products keeping only the datasets the GrIMP tools read, converting the large bands to float16 and storing the RTC factor once per track/frame/grid, for about 4.5x less storage than the archive product. It can also convert already-downloaded granules (`--local`). [Documentation](Documents/downloadNISARoptimized.md)

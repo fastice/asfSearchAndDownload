@@ -15,6 +15,8 @@ Search the ASF DAAC for NISAR / Sentinel-1 products, dedupe against a local arch
 | `checkFramesS1` | `checkFramesS1.py:main()` | Vet filed datatakes (burst "frames"), restructure, and queue → toProcess/pending/problem |
 | `downloadNISARoptimized` | `downloadNISARoptimized.py:main()` | Fetch NISAR products keeping only the datasets the GrIMP tools read, as float16, with a shared RTC factor |
 | `downloadRSLCSubset` | `downloadRSLCSubset.py:main()` | Fetch a spatial subset of a NISAR RSLC as a slim RSLC with cropped, self-consistent geometry |
+| `logNetworkUse` | `networkLog.py:main()` | Log a finished `aria2c -i` session (shell scripts) to `~/networkLogs/networkLog.<host>` |
+| `networkMonitor` | `networkLog.py:monitorMain()` | Cron (every minute): internet-interface (default-route) traffic to `~/networkLogs/interfaceLog.<host>` |
 | `helpers` | `helpers.py` | Library only — `myerror`/`mywarning`/`myalert`/`runMyThreads`, copied from `utilities` so the package does not depend on it |
 | `writeSearchGpkg` | `writeSearchGpkg.py` | Library only (no CLI) — used by `searchASF --gpkg` |
 

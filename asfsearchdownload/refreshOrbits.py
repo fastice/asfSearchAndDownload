@@ -19,6 +19,8 @@ from html.parser import HTMLParser
 
 import requests
 
+from asfsearchdownload.networkLog import logTransfer, now
+
 POEORB_URL = 'https://s1qc.asf.alaska.edu/aux_poeorb/'
 DEFAULT_ORBIT_DIR = '/Volumes/insar9/ian/Data/SentinelGreenland/OPOD'
 ALL_SENSORS = ('S1A', 'S1B', 'S1C', 'S1D')
@@ -109,13 +111,17 @@ def _download(session, url, outPath, chunkSize=1024 * 1024):
     to a .tmp file first so an interrupted download leaves no partial in place.
     '''
     tmpPath = outPath + '.tmp'
+    start, nBytes = now(), 0
     with session.get(url, allow_redirects=True, stream=True) as r:
         r.raise_for_status()
         with open(tmpPath, 'wb') as f:
             for chunk in r.iter_content(chunk_size=chunkSize):
                 if chunk:
                     f.write(chunk)
+                    nBytes += len(chunk)
     os.replace(tmpPath, outPath)
+    logTransfer('refreshOrbits', os.path.basename(outPath), nBytes, start,
+                now())
 
 
 def updateStateVectors(orbitDir=DEFAULT_ORBIT_DIR, sensors=ALL_SENSORS,

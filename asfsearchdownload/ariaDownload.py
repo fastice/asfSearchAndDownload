@@ -13,6 +13,7 @@ import shutil
 from datetime import datetime
 
 from asfsearchdownload.helpers import myerror
+from asfsearchdownload.networkLog import logTransfer, callerName, now
 
 
 def ariaArgs():
@@ -98,7 +99,12 @@ def main():
                 print(f'skipping existing {myFile}')
                 continue
             x = getX() if connections is None else connections
-            call(f'aria2c -x {x} {link.strip()}', shell=True, executable='/bin/csh')
+            start = now()
+            status = call(f'aria2c -x {x} {link.strip()}', shell=True,
+                          executable='/bin/csh')
+            nBytes = os.path.getsize(myFile) if os.path.exists(myFile) else 0
+            logTransfer(f'{callerName()}/ariaDownload', myFile, nBytes, start,
+                        now(), connections=x, status=status)
 
 
 if __name__ == '__main__':

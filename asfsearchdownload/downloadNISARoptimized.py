@@ -45,6 +45,7 @@ import numpy as np
 import requests
 
 from asfsearchdownload.helpers import myerror
+from asfsearchdownload.networkLog import logTransfer, now
 
 # Exit codes, sysexits range, same contract as pullASF.
 OK = 0
@@ -661,8 +662,11 @@ def fetchOne(url, args, desc, session, claimed):
     # is the actual fix.
     os.truncate(os.open(sparse, os.O_WRONLY | os.O_CREAT), size)
     t0 = time.time()
+    start = now()
     got = asyncio.run(fetchRuns(signed, runs, sparse, args.connections,
                                 args.limit * 1e6 if args.limit else 0))
+    logTransfer('downloadNISARoptimized', stem, got, start, now(),
+                connections=args.connections)
     print('    fetched {:.2f} GB in {:.0f} s ({:.1f} MB/s)'.format(
         got / 1e9, time.time() - t0, got / (time.time() - t0) / 1e6), flush=True)
     return dict(stem=stem, sparse=sparse, outPath=outPath,

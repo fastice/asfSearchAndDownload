@@ -33,6 +33,8 @@ Repository = "https://github.com/fastice/asfSearchAndDownload"
 [project.scripts]
 checkExcludeFrames = "asfsearchdownload.checkExcludeFrames:main"
 ariaDownload = "asfsearchdownload.ariaDownload:main"
+logNetworkUse = "asfsearchdownload.networkLog:main"
+networkMonitor = "asfsearchdownload.networkLog:monitorMain"
 "ariaDownload.py" = "asfsearchdownload.ariaDownload:main"
 reduces1 = "asfsearchdownload.reduceSentinel1:main"
 pullASF = "asfsearchdownload.pullASF:main"
