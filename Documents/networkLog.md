@@ -48,3 +48,16 @@ on each host with:
 
 The difference between the two logs is traffic the instrumented programs do not cover
 (Landsat `getusgs`, isce2grimp, GDAL `/vsicurl` reads, browsers, ...).
+
+## plotNetworkUse: plot the last N hours
+
+```
+plotNetworkUse [--hours 24] [--end 2026-10-08T12:00] [--hosts helheim ryder petermann] [--out networkUse.png]
+```
+
+One panel per host, all on the same time and MB/s scales: download (rx) as a filled area,
+upload (tx) as a dashed line, and the periods each job was downloading shaded in a fixed
+color per job (autoupdateNISAR blue, autoupdateS1 orange, pullASF aqua, gcovDownload
+yellow, refreshOrbits pink, fetchMates green, manual violet). Each panel title gives
+that host's GB down/up and peak MB/s. By default it plots every host that has an
+`interfaceLog`.

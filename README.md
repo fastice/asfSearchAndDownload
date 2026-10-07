@@ -22,7 +22,7 @@ pip install git+https://github.com/fastice/asfSearchAndDownload.git@main
 
 ### Network usage logging
 
-**logNetworkUse / networkMonitor** document network usage per machine in `~/networkLogs/` (shared home). Every download made through ariaDownload, refreshS1Orbits, downloadNISARoptimized or downloadRSLCSubset appends start/end/MB/MB/s to `networkLog.<host>`; networkMonitor, run from cron each minute, logs the whole host's internet-interface traffic to `interfaceLog.<host>`. [Documentation](Documents/networkLog.md)
+**logNetworkUse / networkMonitor** document network usage per machine in `~/networkLogs/` (shared home). Every download made through ariaDownload, refreshS1Orbits, downloadNISARoptimized or downloadRSLCSubset appends start/end/MB/MB/s to `networkLog.<host>`; networkMonitor, run from cron each minute, logs the whole host's internet-interface traffic to `interfaceLog.<host>`. **plotNetworkUse** plots the last N hours (default 24) for all hosts. [Documentation](Documents/networkLog.md)
 
 ### NISAR slim downloads
 
