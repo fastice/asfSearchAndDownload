@@ -77,6 +77,23 @@ def readJobSpans(host, t0, t1, gap=timedelta(minutes=2)):
     return spans
 
 
+def loggedGBBefore(host, t0, t1):
+    '''
+    GB of logged downloads (networkLog) falling in (t0, t1], prorated by time
+    for a download that straddles either end. Used for the part of the window
+    before the host's interface monitor started.
+    '''
+    mb = 0.
+    for r in readRows(os.path.join(LOG_DIR, f'networkLog.{host}')):
+        start = datetime.fromisoformat(r['start'])
+        end = datetime.fromisoformat(r['end'])
+        overlap = (min(end, t1) - max(start, t0)).total_seconds()
+        if overlap > 0:
+            mb += float(r['MB']) * overlap / max(
+                (end - start).total_seconds(), 1e-3)
+    return mb / 1e3
+
+
 def segments(rows):
     ''' Split rows where the monitor missed samples, so gaps are not bridged '''
     seg = []
@@ -138,6 +155,7 @@ def main():
                              figsize=(13, 2.6 * len(hosts) + 1.2),
                              squeeze=False, layout='constrained')
     tz = t1.tzinfo
+    totalGB = 0.
     for ax, host in zip(axes[:, 0], hosts):
         for job, jobSpans in spans[host].items():
             for start, end in jobSpans:
@@ -154,9 +172,19 @@ def main():
         rxGB = sum(r[1] * r[2] for r in rows) / 1e3
         txGB = sum(r[1] * r[3] for r in rows) / 1e3
         peak = max((r[2] for r in rows), default=0)
+        # Before the interface monitor started, fall back on the download log
+        # (the two never cover the same time, so nothing is counted twice).
+        monitorStart = rows[0][0] - timedelta(seconds=rows[0][1]) if rows \
+            else t1
+        preGB = loggedGBBefore(host, t0, monitorStart) \
+            if monitorStart > t0 else 0.
+        downGB = rxGB + preGB
+        totalGB += downGB
         iface = readRows(os.path.join(LOG_DIR, f'interfaceLog.{host}'))
         iface = iface[-1]['interface'] if iface else '?'
-        ax.set_title(f'{host} ({iface}):  {rxGB:.1f} GB down, '
+        note = (f' (incl. {preGB:.1f} GB from download log before '
+                f'{monitorStart:%H:%M})') if preGB >= 0.05 else ''
+        ax.set_title(f'{host} ({iface}):  {downGB:.1f} GB down{note}, '
                      f'{txGB:.1f} GB up, peak {peak:.1f} MB/s',
                      loc='left', fontsize=10, color=INK)
         ax.set_ylabel('MB/s', color=MUTED)
@@ -179,8 +207,9 @@ def main():
     handles += [Patch(facecolor=colors[j], alpha=0.35, label=j) for j in jobs]
     fig.legend(handles=handles, loc='outside upper center',
                ncol=min(len(handles), 5), frameon=False, fontsize=9)
-    ax.set_xlabel(f'Internet traffic per host, {t0:%Y-%m-%d %H:%M} to '
-                  f'{t1:%Y-%m-%d %H:%M %Z}', color=MUTED)
+    ax.set_xlabel(f'Total downloaded, all {len(hosts)} machines: '
+                  f'{totalGB:,.1f} GB   ({t0:%Y-%m-%d %H:%M} to '
+                  f'{t1:%Y-%m-%d %H:%M %Z})', color=INK, fontsize=11)
     fig.savefig(args.out, dpi=150, bbox_inches='tight')
     print(f'Wrote {args.out}')
 
