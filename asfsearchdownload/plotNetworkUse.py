@@ -7,6 +7,7 @@ area, upload (tx) as a line, and the periods each job was downloading
 (networkLog.<host>) shaded in a fixed color per job.
 """
 import argparse
+import collections
 import csv
 import glob
 import os
@@ -77,21 +78,34 @@ def readJobSpans(host, t0, t1, gap=timedelta(minutes=2)):
     return spans
 
 
-def loggedGBBefore(host, t0, t1):
+def minuteOf(t):
     '''
-    GB of logged downloads (networkLog) falling in (t0, t1], prorated by time
-    for a download that straddles either end. Used for the part of the window
-    before the host's interface monitor started.
+    Minute bucket for an interface sample at t (e.g. 07:45:01 -> 07:45), which
+    covers the minute ending there, as the plots' step='pre' draws it
     '''
-    mb = 0.
+    return t.replace(second=0, microsecond=0)
+
+
+def loggedMBPerMinute(host, t0, t1):
+    '''
+    MB of logged downloads (networkLog) in each minute bucket of (t0, t1],
+    prorated by time. Used for the part of the window before the host's
+    interface monitor started.
+    '''
+    mb = collections.Counter()
+    minute = timedelta(minutes=1)
     for r in readRows(os.path.join(LOG_DIR, f'networkLog.{host}')):
         start = datetime.fromisoformat(r['start'])
         end = datetime.fromisoformat(r['end'])
-        overlap = (min(end, t1) - max(start, t0)).total_seconds()
-        if overlap > 0:
-            mb += float(r['MB']) * overlap / max(
-                (end - start).total_seconds(), 1e-3)
-    return mb / 1e3
+        a, b = max(start, t0), min(end, t1)
+        if b <= a:
+            continue
+        rate = float(r['MB']) / max((end - start).total_seconds(), 1e-3)
+        m = minuteOf(a) + minute
+        while m - minute < b:
+            mb[m] += rate * (min(b, m) - max(a, m - minute)).total_seconds()
+            m += minute
+    return mb
 
 
 def segments(rows):
@@ -104,6 +118,30 @@ def segments(rows):
         seg.append(row)
     if seg:
         yield seg
+
+
+def styleAxis(ax, title):
+    ''' Title, recessive grid and spines, muted ticks '''
+    ax.set_title(title, loc='left', fontsize=10, color=INK)
+    ax.set_ylabel('MB/s', color=MUTED)
+    ax.grid(axis='y', color=GRID, lw=0.8)
+    ax.set_axisbelow(True)
+    for side in ('top', 'right'):
+        ax.spines[side].set_visible(False)
+    for side in ('left', 'bottom'):
+        ax.spines[side].set_color(GRID)
+    ax.tick_params(colors=MUTED, labelsize=9)
+
+
+def plotTraffic(ax, rows):
+    ''' Download as a filled step area, upload as a dashed step line '''
+    for seg in segments(rows):
+        t = [r[0] for r in seg]
+        rx = [r[2] for r in seg]
+        tx = [r[3] for r in seg]
+        ax.fill_between(t, rx, step='pre', color=INK, alpha=0.30, lw=0)
+        ax.step(t, rx, where='pre', color=INK, lw=1.0)
+        ax.step(t, tx, where='pre', color=MUTED, lw=1.0, ls='--')
 
 
 def assignColors(jobs):
@@ -151,24 +189,25 @@ def main():
     jobs = sorted({j for s in spans.values() for j in s})
     colors = assignColors(jobs)
     #
-    fig, axes = plt.subplots(len(hosts), 1, sharex=True, sharey=True,
-                             figsize=(13, 2.6 * len(hosts) + 1.2),
+    # Last row: all machines summed, on its own MB/s scale.
+    fig, axes = plt.subplots(len(hosts) + 1, 1, sharex=True,
+                             figsize=(13, 2.6 * (len(hosts) + 1) + 1.2),
                              squeeze=False, layout='constrained')
+    for ax in axes[1:-1, 0]:
+        ax.sharey(axes[0, 0])
     tz = t1.tzinfo
     totalGB = 0.
-    for ax, host in zip(axes[:, 0], hosts):
+    rxSum, txSum = collections.Counter(), collections.Counter()
+    for ax, host in zip(axes[:-1, 0], hosts):
         for job, jobSpans in spans[host].items():
             for start, end in jobSpans:
                 ax.axvspan(max(start, t0), min(end, t1), color=colors[job],
                            alpha=0.22, lw=0)
         rows = traffic[host]
-        for seg in segments(rows):
-            t = [r[0] for r in seg]
-            rx = [r[2] for r in seg]
-            tx = [r[3] for r in seg]
-            ax.fill_between(t, rx, step='pre', color=INK, alpha=0.30, lw=0)
-            ax.step(t, rx, where='pre', color=INK, lw=1.0)
-            ax.step(t, tx, where='pre', color=MUTED, lw=1.0, ls='--')
+        plotTraffic(ax, rows)
+        for t, _, rx, tx in rows:
+            rxSum[minuteOf(t)] += rx
+            txSum[minuteOf(t)] += tx
         rxGB = sum(r[1] * r[2] for r in rows) / 1e3
         txGB = sum(r[1] * r[3] for r in rows) / 1e3
         peak = max((r[2] for r in rows), default=0)
@@ -176,26 +215,33 @@ def main():
         # (the two never cover the same time, so nothing is counted twice).
         monitorStart = rows[0][0] - timedelta(seconds=rows[0][1]) if rows \
             else t1
-        preGB = loggedGBBefore(host, t0, monitorStart) \
-            if monitorStart > t0 else 0.
+        preMB = loggedMBPerMinute(host, t0, monitorStart) \
+            if monitorStart > t0 else {}
+        for m, mb in preMB.items():
+            rxSum[m] += mb / 60
+        preGB = sum(preMB.values()) / 1e3
         downGB = rxGB + preGB
         totalGB += downGB
         iface = readRows(os.path.join(LOG_DIR, f'interfaceLog.{host}'))
         iface = iface[-1]['interface'] if iface else '?'
         note = (f' (incl. {preGB:.1f} GB from download log before '
                 f'{monitorStart:%H:%M})') if preGB >= 0.05 else ''
-        ax.set_title(f'{host} ({iface}):  {downGB:.1f} GB down{note}, '
-                     f'{txGB:.1f} GB up, peak {peak:.1f} MB/s',
-                     loc='left', fontsize=10, color=INK)
-        ax.set_ylabel('MB/s', color=MUTED)
-        ax.grid(axis='y', color=GRID, lw=0.8)
-        ax.set_axisbelow(True)
-        for side in ('top', 'right'):
-            ax.spines[side].set_visible(False)
-        for side in ('left', 'bottom'):
-            ax.spines[side].set_color(GRID)
-        ax.tick_params(colors=MUTED, labelsize=9)
+        styleAxis(ax, f'{host} ({iface}):  {downGB:.1f} GB down{note}, '
+                      f'{txGB:.1f} GB up, peak {peak:.1f} MB/s')
+    axes[0, 0].set_ylim(bottom=0)
+    #
     ax = axes[-1, 0]
+    total = []
+    if rxSum:
+        m, minute = min(rxSum), timedelta(minutes=1)
+        while m <= minuteOf(t1):
+            total.append((m, 60., rxSum[m], txSum[m]))
+            m += minute
+    plotTraffic(ax, total)
+    peakTime, peak = max(((r[0], r[2]) for r in total),
+                         key=lambda x: x[1], default=(t1, 0))
+    styleAxis(ax, f'All {len(hosts)} machines:  {totalGB:,.1f} GB down, '
+                  f'peak {peak:.1f} MB/s at {peakTime:%H:%M}')
     ax.set_xlim(t0, t1)
     ax.set_ylim(bottom=0)
     locator = mdates.AutoDateLocator(tz=tz)
@@ -207,9 +253,8 @@ def main():
     handles += [Patch(facecolor=colors[j], alpha=0.35, label=j) for j in jobs]
     fig.legend(handles=handles, loc='outside upper center',
                ncol=min(len(handles), 5), frameon=False, fontsize=9)
-    ax.set_xlabel(f'Total downloaded, all {len(hosts)} machines: '
-                  f'{totalGB:,.1f} GB   ({t0:%Y-%m-%d %H:%M} to '
-                  f'{t1:%Y-%m-%d %H:%M %Z})', color=INK, fontsize=11)
+    ax.set_xlabel(f'Internet traffic per host, {t0:%Y-%m-%d %H:%M} to '
+                  f'{t1:%Y-%m-%d %H:%M %Z}', color=MUTED)
     fig.savefig(args.out, dpi=150, bbox_inches='tight')
     print(f'Wrote {args.out}')
 
