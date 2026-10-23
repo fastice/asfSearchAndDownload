@@ -673,8 +673,58 @@ def searchGranules(config, args, today, firstDate, lastDate, check=False):
                + excludeFlags
                + [firstDate, lastDate, out])
     log.info('search: ' + ' '.join(command))
-    subprocess.run(command, check=True)
+    runSearchCommand(command, config)
     return out
+
+
+def searchOutputLines(text, keep=30):
+    """
+    The tail of searchASF's output, with its progress spinner removed.
+
+    The spinner rewrites one line with carriage returns, so the raw capture is thousands of
+    "Searching ASF (SENTINEL1)... |" fragments on a single line. Split on \r and drop them,
+    or the log entry for a failure is unreadable.
+    """
+    lines = []
+    for line in text.replace('\r', '\n').splitlines():
+        line = line.rstrip()
+        if line and not line.startswith('Searching ASF ('):
+            lines.append(line)
+    return lines[-keep:]
+
+
+def runSearchCommand(command, config):
+    """
+    Run searchASF, logging its output, and retry a failure before giving up.
+
+    Two things this fixes, both seen in production:
+
+    Its output used to go straight to the cron job's stdout, so when it exited non-zero the
+    session log held only a CalledProcessError with no reason -- four failed sessions
+    (2026-10-13, 15, 20 and 22) left nothing to diagnose. Now stdout and stderr are captured
+    and the tail of them is logged.
+
+    A failure also killed the whole session, download and filing included, even though the
+    searches that fail do so inside the CMR query and succeed when repeated. The search is
+    therefore attempted `searchAttempts` times, `searchRetryDelay` seconds apart.
+    """
+    attempts = max(int(config.get('searchAttempts', 3)), 1)
+    delay = float(config.get('searchRetryDelay', 180.))
+    for attempt in range(1, attempts + 1):
+        proc = subprocess.run(command, capture_output=True, text=True)
+        if proc.returncode == 0:
+            for line in searchOutputLines(proc.stdout or '', keep=10):
+                log.info(f'  searchASF: {line}')
+            return
+        log.error(f'searchASF failed (attempt {attempt}/{attempts}, '
+                  f'exit {proc.returncode}); its output:')
+        for line in searchOutputLines((proc.stdout or '') + '\n' + (proc.stderr or '')):
+            log.error(f'  searchASF: {line}')
+        if attempt < attempts:
+            log.info(f'retrying the search in {delay:.0f} s')
+            time.sleep(delay)
+    raise subprocess.CalledProcessError(proc.returncode, command,
+                                        output=proc.stdout, stderr=proc.stderr)
 
 
 def readUrlList(urlListFile):
