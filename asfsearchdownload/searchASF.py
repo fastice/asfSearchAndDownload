@@ -1123,6 +1123,14 @@ Part of the asfSearchAndDownload package.
     )
 
     parser.add_argument(
+        '--cmrTimeout', type=int, default=120, metavar='SECONDS',
+        help='Seconds to wait for a CMR page before giving up [120]. '
+             "asf_search's own default is 30, which a multi-month query loses to "
+             'whenever CMR is slow -- the search then dies with "CMR took too long to '
+             'respond" although the identical query succeeds minutes later.',
+    )
+
+    parser.add_argument(
         '--strictComplete', action='store_true', default=False,
         help='Re-run the search when CMR returns an incomplete response, and '
              'exit non-zero rather than write a possibly-short result. For '
@@ -1190,6 +1198,16 @@ Part of the asfSearchAndDownload package.
         import asf_search as asf
     except ImportError:
         sys.exit('asf_search not installed. Run: pip install asf-search')
+
+    # asf_search ships a 30 s CMR timeout, which a six-month Greenland query outgrows
+    # whenever CMR is slow: four autoupdateS1 sessions in October 2026 (13th, 15th, 20th,
+    # 22nd) died on
+    #   ASFSearchError: Connection Error (Timeout): CMR took too long to respond
+    # while the identical search succeeded minutes later. The retries inside asf_search do
+    # not help, because each attempt hits the same deadline. --cmrTimeout overrides it.
+    asf.constants.INTERNAL.CMR_TIMEOUT = args.cmrTimeout
+    if args.cmrTimeout != 30:
+        print(f'CMR timeout set to {args.cmrTimeout} s', file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Session — authenticate for restricted-data access.
