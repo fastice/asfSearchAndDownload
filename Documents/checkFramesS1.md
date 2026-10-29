@@ -21,7 +21,11 @@ ascending-node date is in the window:
    - **Out-of-range** SAFEs (wholly below `low` or above `high`) → `track-*/tmp/`.
    - **Gaps** (a >1-burst break between consecutive SAFEs): the first (near-side)
      segment stays in `<orbit>`; each later (far-side) segment moves to
-     `<orbit>_1`, `<orbit>_2`, ….
+     `<orbit>_1`, `<orbit>_2`, …. SAFEs that arrive on a later night land in
+     `<orbit>`, so the SAFEs of any still-unprocessed `_1`–`_3` units are pulled
+     back in and the whole datatake is re-segmented; processed, `Ignore`d or
+     `Failed` units are left alone and their suffixes skipped. A unit emptied by
+     the regrouping is dropped from the queues.
    - **Over-length** (in-range burst span > 127): the first *n* SAFEs move to
      `<orbit>_4`. *n* is derived from the frameRange (the largest head whose
      in-range span stays ≤127), so every orbit in a track splits at the same

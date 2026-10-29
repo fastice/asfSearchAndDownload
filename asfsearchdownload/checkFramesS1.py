@@ -180,8 +180,39 @@ def analyzeOrbit(trackDir, orbit, frameRange, opts):
         residual - dict unitName -> unresolved-issue reason (or None)
     In --check nothing is moved; the plan is still computed for reporting. '''
     barePath = os.path.join(trackDir, str(orbit))
-    info = getOrbitSafe(barePath, getAscNodeTime(barePath, opts['check']))
+    ascNodeTime = getAscNodeTime(barePath, opts['check'])
+    info = getOrbitSafe(barePath, ascNodeTime)
     units, moves, toTmp, residual = {}, [], [], {}
+
+    # A datatake downloaded over more than one night is segmented again when
+    # its late SAFEs land in the bare dir. Pull the SAFEs of earlier gap units
+    # that are still unprocessed back in, so the whole datatake is segmented as
+    # one; otherwise the new far-side segment is numbered from _1 again and is
+    # moved into an existing unit it does not belong with (track-61/4477,
+    # 2026-09). Processed, Ignore'd or Failed units are left alone and their
+    # suffixes are not reused.
+    held, pulled = set(), []
+    for suffix in range(GAP_SUFFIX_START, SPLIT_SUFFIX):
+        uname = f'{orbit}_{suffix}'
+        upath = os.path.join(trackDir, uname)
+        if not os.path.isdir(upath):
+            continue
+        if isProcessed(trackDir, uname) or any(
+                os.path.exists(os.path.join(upath, f))
+                for f in ('Ignore', 'Failed')):
+            held.add(suffix)
+            continue
+        rows = getOrbitSafe(upath, ascNodeTime)
+        if rows:                      # an emptied dir from an earlier regroup
+            info += rows
+            pulled.append(uname)
+    info.sort(key=lambda r: r[2])
+
+    def movesTo(rows, uname):
+        ''' Moves for the rows of a unit that are not already in its dir. '''
+        destDir = os.path.join(trackDir, uname)
+        return [(r[6], uname) for r in rows
+                if os.path.dirname(r[6]) != destDir]
 
     # out-of-range trim
     oor = outOfRange(info, frameRange)
@@ -192,10 +223,14 @@ def analyzeOrbit(trackDir, orbit, frameRange, opts):
         toTmp = [info[i][6] for i in sorted(oor)]
     inRange = [r for i, r in enumerate(info) if i not in oor]
 
-    diag = {'info': info, 'inRange': inRange, 'gaps': []}
+    diag = {'info': info, 'inRange': inRange, 'gaps': [], 'emptied': []}
     if not inRange:
         units[str(orbit)] = list(info)
         residual[str(orbit)] = 'out-of-range'
+        diag['emptied'] = pulled      # their SAFEs all went to tmp/
+        for uname in pulled:
+            units[uname] = []
+            residual[uname] = None
         return units, moves, toTmp, residual, diag
 
     # gap segmentation: the first (near-side) segment stays in <orbit>; each
@@ -208,9 +243,11 @@ def analyzeOrbit(trackDir, orbit, frameRange, opts):
         bareSeg = segments[0]
         suffix = GAP_SUFFIX_START
         for seg in segments[1:]:
+            while suffix in held:
+                suffix += 1
             uname = f'{orbit}_{suffix}'
             units[uname] = list(seg)
-            moves += [(r[6], uname) for r in seg]
+            moves += movesTo(seg, uname)
             suffix += 1
     else:
         bareSeg = inRange
@@ -227,14 +264,22 @@ def analyzeOrbit(trackDir, orbit, frameRange, opts):
             head, bareSeg = bareSeg[:n], bareSeg[n:]
             uname = f'{orbit}_{SPLIT_SUFFIX}'
             units[uname] = list(head)
-            moves += [(r[6], uname) for r in head]
+            moves += movesTo(head, uname)
         else:
             overResidual = True       # noSplit, or <orbit>_4 already exists
 
     units[str(orbit)] = list(bareSeg) + stays
+    moves += movesTo(units[str(orbit)], str(orbit))   # pulled SAFEs come home
     residual[str(orbit)] = ('gap' if gapResidual else
                             'over-length' if overResidual else
                             'out-of-range' if stays else None)
+
+    # pulled units the regrouping left with no SAFEs; the caller drops them
+    # from the queues
+    diag['emptied'] = [u for u in pulled if u not in units]
+    for uname in diag['emptied']:
+        units[uname] = []
+        residual[uname] = None
 
     # pre-existing _N units from earlier runs (route them too)
     for other in sorted(glob.glob(os.path.join(trackDir, f'{orbit}_*'))):
@@ -593,7 +638,15 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
                 rows = units[unitName]
                 rel = f'{trackName}/{unitName}'
                 frames = frameStr(rows, frameRange)
-                if isProcessed(trackDir, unitName):
+                if unitName in diag['emptied']:
+                    # regrouped into other units: its queue entry, if any,
+                    # describes SAFEs it no longer holds
+                    for name in QUEUES:
+                        if rel in {entryUnit(e) for e in queues[name]}:
+                            deltas['remove'][name].append(rel)
+                    seen.discard(rel)
+                    tag = 'emptied (SAFEs regrouped)'
+                elif isProcessed(trackDir, unitName):
                     tag = 'processed'
                 elif rel in seen:
                     tag = 'already queued'
