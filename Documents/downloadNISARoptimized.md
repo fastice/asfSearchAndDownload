@@ -46,6 +46,58 @@ derives the sharing key. Do not replace this with an HDF5 virtual dataset: on
 GDAL 3.11.5/HDF5 2.2.0 it is ~3000x slower and fails silently when the source is
 missing.
 
+## ROFF (`--product ROFF`)
+
+Keeps what `ROFFtoGrimp` reads: `slantRangeOffset`, `alongTrackOffset` and
+`correlationSurfacePeak` in all three layers, plus every metadata dataset (geolocation grid,
+orbit, identification). Drops the three variances, `snr` and the DEM -- `ROFFtoGrimp`'s sigmas
+come from `cullst`, not the product. The kept layers stay **float32 with the same filters and
+paths**, rounded to 10 mantissa bits (relative error <= 4.9e-4), so `nisarhdf` and GDAL read
+them unchanged; the rounding is what lets gzip+shuffle pack them ~2x tighter. No shared
+factor, so `--factorDir` is not used. Each rounded layer carries `grimpMantissaBits = 10`.
+
+Measured:
+
+| granule | archive | slim | fetched |
+|---|---|---|---|
+| Greenland 77 MHz (018_084_D_051) | 495 MB | 148 MB | 0.23 GB / 12 s |
+| Antarctica 40 MHz (025_100_D_128) | 1065 MB | 285 MB | (local) |
+
+Through `ROFFtoGrimp` (40 MHz frame, production flags) the final `range.offsets` /
+`azimuth.offsets` differ from the full product by ~1e-3 px RMS, 0.06% / 0.005% of range
+pixels by more than 0.01 / 0.05 px -- smaller than `ROFFtoGrimp`'s own run-to-run scatter on
+identical input (0.38% / 0.06%) before `lltora` was made repeatable (mosaicSource 6675133); with
+the repeatable `lltora` the full-vs-slim difference is 3.2e-4 px range / 9.5e-5 px azimuth RMS.
+
+## RUNW (`--product RUNW`)
+
+Keeps what `RUNWtoGrimp`, `estimateIonosphere` and `carrierCorrection` read: `unwrappedPhase`,
+`coherenceMagnitude`, `ionospherePhaseScreen`, `connectedComponents`, `interferogram/mask`, all of
+`pixelOffsets` except its DEM, and the geolocation grid except `coordinateX`/`coordinateY` (GrIMP
+does its own geocoding; only nisarhdf's uncalled `xyCube` reads them). Drops both DEMs (nisarhdf
+fills the interferogram one with zeros rather than reading it) and
+`ionospherePhaseScreenUncertainty`. Every float32 raster and cube is rounded to 10 mantissa bits,
+`unwrappedPhase` to 12 (its error scales with |phase|: at ~430 rad, 10 bits is 0.12 rad max,
+12 bits 0.031 rad). Cubes stored uncompressed (the two baselines, 57 MB) are gzipped as well.
+
+Measured on a 40 MHz Antarctic frame (025_100_D_128): 375 MB -> 70 MB. Through a one-frame
+`SetupNISAR` sandbox (slim RUNW, full ROFF) against the full product: corrected unwrapped phase
+1.2e-4 rad RMS (max 0.085), ionosphere correction 2.6e-4 rad RMS, range/azimuth offsets
+identical.
+
+## Reading slim products
+
+`nisarhdf` limits its *default* field lists to the bands a file holds (`fieldsInFile`), printing
+one `not in file, skipped:` line per list, and `wrapH5WithVRT` does the same, so full and slim
+products both open and VRT. A field requested explicitly with `fields=` still fails if absent.
+
+## GCOV granules written before the float16 floor
+
+`verifySlim` fails a GCOV whose valid minimum is below `F16FLOOR` only if its band carries
+`grimpFlooredToF16Floor`. Granules written before the clamp (8c6224c) lack it and get a
+`note: ... predates the F16FLOOR clamp` line instead; reconvert them to apply the floor (the lost
+pixels cluster at frame edges).
+
 ## Local conversion (`--local`)
 
 With `--local`, `--urls` lists **local** granule paths, which are converted with
@@ -61,10 +113,12 @@ downloadNISARoptimized --urls FILE [options]
   --urls FILE          File with one granule URL (or, with --local, path) per line
   --outputDir DIR      Where slim granules are written [.]
   --factorDir DIR      Where shared RTC factors live [<outputDir>/factors]
-  --product GCOV       NISAR product type (only GCOV implemented) [GCOV]
-  --polarization TERM  Covariance term to keep [HHHH]
+  --product GCOV|ROFF  NISAR product type [GCOV]
+  --polarization TERM  Covariance term (GCOV) or polarization (ROFF) to keep
+                       [HHHH for GCOV, HH for ROFF]
   --frequency A|B      Frequency [A]
-  --float32            Keep the float bands at full precision (default float16)
+  --float32            Keep the float bands at full precision
+                       (default float16 for GCOV, 10-bit mantissa for ROFF)
   --noShareFactor      Store the RTC factor in each granule instead of sharing it
   --connections N      Parallel range requests per granule [16]
   --limit MBPS         Bandwidth cap in MB/s, 0 for none [19]

@@ -82,24 +82,32 @@ F16MINNORMAL = 6.104e-5
 # around -25 dB, so -40 dB is already 15 dB of margin below anything measured; what sits
 # below it is water, radar shadow and processing residue, and on a sampled 34.9 M valid
 # pixels 0.065% fell under float16's subnormal floor (-72 dB) where they flush to zero and
-# geomosaic then DROPS them -- speckled holes in exactly the dark areas, and concentrated at
-# the FRAME EDGES, where the last rows decay toward 1e-16: 26% of the valid pixels in the
-# bottom row block of a cycle-030 frame, against 1 in 10 M mid-frame. That is a feathering
-# seam losing coverage, not uniform speckle. Saturating is the same choice already made at
-# the ceiling, and for the same reason: a clamped value is an honest "below the noise floor",
-# a dropped pixel is a coverage change no dB comparison catches. 1e-4 is a normal float16, so
-# it stores exactly and the subnormal range (another 0.138% of pixels, at reduced precision)
-# stops being used at all.
+# geomosaic then DROPS them -- speckled holes in exactly the dark areas. Saturating is the
+# same choice already made at the ceiling, and for the same reason: a clamped value is an
+# honest "below the noise floor", a dropped pixel is a coverage change that no dB comparison
+# catches. 1e-4 is a normal float16, so it stores exactly and the subnormal range (another
+# 0.138% of pixels, at reduced precision) stops being used at all.
 F16FLOOR = 1.0e-4
 
-# Per-product descriptor. GCOV is the only one implemented; the shape is here so RSLC, RUNW
-# and ROFF can be added without touching the fetch/repack machinery.
-#   drop       - dataset paths (or group prefixes) never transferred
-#   fp16       - datasets converted to float16 on repack
-#   shared     - dataset stored once per (track, frame, grid) and referenced by every cycle
-#   gridFrom   - dataset whose raster shape and coordinates define the grid key
+# Per-product descriptor. GCOV, ROFF and RUNW are implemented; the shape is here so RSLC can
+# be added without touching the fetch/repack machinery.
+#   dropGrids  - dataset basenames under the grid never transferred
+#   dropCubes  - dataset basenames under radarGrid never transferred
+#   lossy      - how the big kept rasters are reduced: 'float16' or 'mantissa'
+#   shared     - dataset stored once per (track, frame, grid) and referenced by every cycle,
+#                or None
+#   polPath    - where the polarization's data sits under the grid
+#   mantissaBits, mantissaBitsFor - bits kept by 'mantissa' (default, per dataset basename)
+#   lossyGroups - if given, every float32 raster/cube under these is rounded (RUNW);
+#                otherwise only mantissaLayers under polPath (ROFF)
+#   slimMarker - dataset whose absence marks a granule already slim (--local skips it)
+#   required   - datasets verifySlim insists on
 PRODUCTS = {
     'GCOV': {
+        'product': 'GCOV',
+        'polarization': 'HHHH',
+        'polPath': '{grid}/{pol}',
+        'lossy': 'float16',
         'root': '/science/LSAR/GCOV',
         'grid': '/science/LSAR/GCOV/grids/frequency{f}',
         'radarGrid': '/science/LSAR/GCOV/metadata/radarGrid',
@@ -127,6 +135,68 @@ PRODUCTS = {
         'dropGrids': ('numberOfLooks', 'inputDataExceptionMask'),
         'shared': 'rtcGammaToSigmaFactor',
     },
+    'ROFF': {
+        'product': 'ROFF',
+        'polarization': 'HH',
+        'polPath': '{grid}/pixelOffsets/{pol}',
+        'root': '/science/LSAR/ROFF',
+        'grid': '/science/LSAR/ROFF/swaths/frequency{f}',
+        # ROFFtoGrimp reads slantRangeOffset, alongTrackOffset and correlationSurfacePeak
+        # (all three layers); its sigmas come from cullst, not the product's variances. The
+        # dropped five are ~2/3 of the file. nisarhdf and wrapH5WithVRT load only the bands a
+        # file holds (fieldsInFile), so slim and full products both open.
+        'dropGrids': ('alongTrackOffsetVariance', 'slantRangeOffsetVariance',
+                      'crossOffsetVariance', 'snr', 'digitalElevationModel'),
+        # Kept layers stay float32 with the same filters, rounded to 10 mantissa bits (relative
+        # error <= 4.9e-4) so gzip+shuffle packs them ~2x tighter and every reader is unchanged.
+        # Measured on a 40 MHz Antarctic frame, the final range/azimuth offsets differ from the
+        # full product by 1e-3 px RMS, less than ROFFtoGrimp's own run-to-run scatter.
+        'lossy': 'mantissa',
+        'mantissaBits': 10,
+        'mantissaLayers': ('slantRangeOffset', 'alongTrackOffset', 'correlationSurfacePeak'),
+        'shared': None,
+        'slimMarker': '{pol}/layer1/snr',
+        'required': [f'{{pol}}/layer{n}/{f}' for n in (1, 2, 3)
+                     for f in ('slantRangeOffset', 'alongTrackOffset', 'correlationSurfacePeak')]
+                    + ['{grid}/pixelOffsets/slantRange', '{grid}/pixelOffsets/zeroDopplerTime',
+                       '{grid}/pixelOffsets/mask', '{root}/metadata/geolocationGrid/coordinateX',
+                       '/science/LSAR/identification/boundingPolygon'],
+    },
+    'RUNW': {
+        'product': 'RUNW',
+        'polarization': 'HH',
+        'polPath': '{grid}/interferogram/{pol}',
+        'root': '/science/LSAR/RUNW',
+        'grid': '/science/LSAR/RUNW/swaths/frequency{f}',
+        # RUNWtoGrimp/estimateIonosphere read unwrappedPhase, coherenceMagnitude,
+        # ionospherePhaseScreen, connectedComponents and interferogram/mask; carrierCorrection
+        # reads pixelOffsets/<pol>/alongTrackOffset. Neither DEM is read (nisarhdf fills the
+        # interferogram one with zeros) and the uncertainty is only listed in a VRT.
+        'dropGrids': ('digitalElevationModel', 'ionospherePhaseScreenUncertainty'),
+        # GrIMP does its own geocoding: coordinateX/Y are only read by nisarhdf's xyCube, which
+        # nothing calls. incidenceAngle, the los/alongTrack unit vectors (squint polynomial) and
+        # groundTrackVelocity (carrierCorrection) are read and kept.
+        'radarGrid': '/science/LSAR/RUNW/metadata/geolocationGrid',
+        'dropCubes': ('coordinateX', 'coordinateY'),
+        # Every float32 raster and cube is rounded (uncompressed ones are gzipped as well, which
+        # takes the two baseline cubes from 57 MB to 2.5 MB). unwrappedPhase gets 12 bits: its
+        # error scales with |phase|, ~430 rad on a 40 MHz Antarctic frame, where 10 bits is
+        # 0.12 rad max (0.07 m/yr on a 12-day pair) and 12 bits 0.031 rad, for +3 MB.
+        'lossy': 'mantissa',
+        'mantissaBits': 10,
+        'mantissaBitsFor': {'unwrappedPhase': 12},
+        'lossyGroups': ('{grid}/', '{root}/metadata/geolocationGrid/'),
+        'shared': None,
+        'slimMarker': '{pol}/ionospherePhaseScreenUncertainty',
+        'required': ['{pol}/unwrappedPhase', '{pol}/coherenceMagnitude',
+                     '{pol}/ionospherePhaseScreen', '{pol}/connectedComponents',
+                     '{grid}/interferogram/mask', '{grid}/pixelOffsets/{p}/alongTrackOffset',
+                     '{root}/metadata/geolocationGrid/incidenceAngle',
+                     '{root}/metadata/geolocationGrid/losUnitVectorX',
+                     '{root}/metadata/geolocationGrid/alongTrackUnitVectorX',
+                     '{root}/metadata/geolocationGrid/groundTrackVelocity',
+                     '/science/LSAR/identification/boundingPolygon'],
+    },
 }
 
 
@@ -144,11 +214,13 @@ def downloadNISARoptimizedArgs():
                         help='where shared RTC factors live [<outputDir>/factors]')
     parser.add_argument('--product', type=str, default='GCOV',
                         choices=sorted(PRODUCTS), help='NISAR product type [GCOV]')
-    parser.add_argument('--polarization', type=str, default='HHHH',
-                        help='covariance term to keep [HHHH]')
+    parser.add_argument('--polarization', type=str, default=None,
+                        help='covariance term (GCOV) or polarization (ROFF/RUNW) to keep '
+                             '[HHHH for GCOV, HH for ROFF/RUNW]')
     parser.add_argument('--frequency', type=str, default='A', help='A or B [A]')
     parser.add_argument('--float32', action='store_true',
-                        help='keep the float bands at full precision (default float16)')
+                        help='keep the float bands at full precision (default float16 for '
+                             'GCOV, 10-bit mantissa for ROFF/RUNW, 12 for RUNW unwrappedPhase)')
     parser.add_argument('--noShareFactor', action='store_true',
                         help='store the RTC factor in each granule instead of sharing it')
     parser.add_argument('--connections', type=int, default=16,
@@ -190,7 +262,7 @@ def trackFrameKey(stem):
     next) gets its own factor, and geomosaic re-checks the raster size at read time anyway.
     '''
     f = stem.split('_')
-    if len(f) < 13 or f[3] != 'GCOV':
+    if len(f) < 13 or f[3] not in PRODUCTS:
         return None
     return f[5], f[6], f[7], f[9], f[10]
 
@@ -240,13 +312,43 @@ def wanted(path, desc, grid, otherGrid, polarization, frequency):
     base = os.path.basename(path)
     if path.startswith(grid) and base in desc['dropGrids']:
         return False
-    if path.startswith(desc['radarGrid']) and base in desc['dropCubes']:
+    if 'radarGrid' in desc and path.startswith(desc['radarGrid']) \
+            and base in desc['dropCubes']:
         return False
     # unused covariance terms: four-letter polarimetric names other than the one kept
     if path.startswith(grid) and len(base) == 4 and base != polarization \
             and all(c in 'HV' for c in base):
         return False
+    # ROFF/RUNW: whole pixelOffsets/<pol> and interferogram/<pol> groups for the other
+    # polarizations
+    if desc['product'] in ('ROFF', 'RUNW'):
+        for sub in ('pixelOffsets', 'interferogram'):
+            if path.startswith(f'{grid}/{sub}/'):
+                p = path[len(f'{grid}/{sub}/'):].split('/')[0]
+                if len(p) == 2 and p != polarization and all(c in 'HV' for c in p):
+                    return False
     return True
+
+
+def isLossy(path, obj, desc, grid, polarization):
+    '''True for the big rasters that are reduced (float16 or mantissa-rounded) on repack.'''
+    if 'lossyGroups' in desc:
+        groups = [g.format(grid=grid, root=desc['root']) for g in desc['lossyGroups']]
+        return (obj.dtype == np.float32 and obj.ndim >= 2
+                and any(path.startswith(g) for g in groups))
+    if desc['lossy'] == 'mantissa':
+        return (path.startswith(desc['polPath'].format(grid=grid, pol=polarization) + '/')
+                and os.path.basename(path) in desc['mantissaLayers'])
+    return path in (f'{grid}/{polarization}', f'{grid}/{desc["shared"]}')
+
+
+def roundMantissa(x, keep):
+    '''Round float32 to `keep` mantissa bits, to nearest (ties away); NaN/inf untouched.'''
+    bits = x.view(np.uint32)
+    drop = 23 - keep
+    mask = np.uint32((0xFFFFFFFF >> drop) << drop)
+    r = (bits + np.uint32(1 << (drop - 1))) & mask
+    return np.where(np.isfinite(x), r, bits).astype(np.uint32).view(np.float32)
 
 
 def keptDatasets(h, desc, polarization, frequency, shareFactor):
@@ -268,7 +370,6 @@ def keptDatasets(h, desc, polarization, frequency, shareFactor):
     '''
     grid = desc['grid'].format(f=frequency)
     otherGrid = desc['grid'].format(f='B' if frequency == 'A' else 'A')
-    big = {f'{grid}/{polarization}', f'{grid}/{desc["shared"]}'}
     chunked, small, groups = [], {}, {}
 
     def visit(name, obj):
@@ -284,7 +385,7 @@ def keptDatasets(h, desc, polarization, frequency, shareFactor):
         if path == f'{grid}/{desc["shared"]}' and shareFactor:
             return                      # handled separately, into the shared factor file
         if obj.chunks is not None:
-            chunked.append((path, path in big))
+            chunked.append((path, isLossy(path, obj, desc, grid, polarization)))
         else:
             small[path] = (obj[()], {k: v for k, v in obj.attrs.items()
                                      if k not in REFERENCE_ATTRS}, obj.dtype)
@@ -367,13 +468,26 @@ async def fetchRuns(url, runs, path, nConn, bytesPerSec):
     return done[0]
 
 
-def copyDataset(src, dst, path, toFloat16, step=4096):
-    '''Copy one dataset, converting to float16 if asked.
+def copyDataset(src, dst, path, toFloat16, step=4096, mantissaBits=None):
+    '''Copy one dataset, converting to float16 or rounding the mantissa if asked.
 
-    Raw chunk copy when the type is unchanged, so nothing is decompressed and the result is
+    Raw chunk copy when the values are unchanged, so nothing is decompressed and the result is
     bit-identical to the archive.
     '''
-    if toFloat16 and src.dtype == np.float32:
+    if mantissaBits is not None and src.dtype == np.float32:
+        # Same dtype, chunks and filters as the source, so readers see no difference; only the
+        # dropped low bits change, which is what lets gzip compress it. A source stored
+        # uncompressed (the RUNW/ROFF baseline cubes) gets gzip+shuffle, or rounding buys nothing.
+        compressed = src.compression is not None
+        d = dst.create_dataset(path, shape=src.shape, dtype=src.dtype, chunks=src.chunks,
+                               compression=src.compression if compressed else 'gzip',
+                               compression_opts=src.compression_opts if compressed else 1,
+                               shuffle=src.shuffle if compressed else True,
+                               fillvalue=src.fillvalue)
+        for y in range(0, src.shape[0], step):
+            d[y:y + step] = roundMantissa(src[y:y + step], mantissaBits)
+        d.attrs['grimpMantissaBits'] = mantissaBits
+    elif toFloat16 and src.dtype == np.float32:
         d = dst.create_dataset(path, shape=src.shape, dtype='f2', chunks=src.chunks,
                                compression=src.compression,
                                compression_opts=src.compression_opts, shuffle=src.shuffle)
@@ -442,6 +556,33 @@ def reattachScales(dst, gridPath, polarization):
         print(f'  warning: could not reattach dimension scales ({e})', flush=True)
 
 
+def reattachScalesFromSource(src, dst):
+    '''Rebuild every dimension-scale attachment the source has whose ends both survived.
+
+    ROFF keeps all of metadata/geolocationGrid, whose cubes are attached to its
+    heightAboveEllipsoid/zeroDopplerTime/slantRange vectors, so the attachments can be
+    resolved by name from the source rather than listed by hand as reattachScales does.
+    '''
+    def visit(name, obj):
+        if not isinstance(obj, h5py.Dataset) or 'DIMENSION_LIST' not in obj.attrs:
+            return
+        path = '/' + name
+        if path not in dst:
+            return
+        for i, refs in enumerate(obj.attrs['DIMENSION_LIST']):
+            for ref in refs:
+                scale = src[ref].name
+                if scale not in dst:
+                    continue
+                if not dst[scale].is_scale:
+                    dst[scale].make_scale(os.path.basename(scale))
+                dst[path].dims[i].attach_scale(dst[scale])
+    try:
+        src.visititems(visit)
+    except Exception as e:
+        print(f'  warning: could not reattach dimension scales ({e})', flush=True)
+
+
 def repack(job, desc, polarization, frequency, toFloat16):
     '''Build the slim granule (and the shared factor, if it is not already there).'''
     grid = desc['grid'].format(f=frequency)
@@ -449,10 +590,14 @@ def repack(job, desc, polarization, frequency, toFloat16):
     outPath, tmp = job['outPath'], job['outPath'] + '.partial'
     with h5py.File(job['sparse'], 'r') as s:
         with h5py.File(tmp, 'w') as d:
+            mantissa = desc['lossy'] == 'mantissa'
             for path, big in job['chunked']:
                 if path == sharedPath and job['shareFactor']:
                     continue            # lives in the shared file, not in the granule
-                copyDataset(s[path], d, path, toFloat16 and big)
+                bits = desc.get('mantissaBitsFor', {}).get(os.path.basename(path),
+                                                           desc.get('mantissaBits'))
+                copyDataset(s[path], d, path, toFloat16 and big and not mantissa,
+                            mantissaBits=bits if toFloat16 and big and mantissa else None)
             for path, (data, attrs, dtype) in job['small'].items():
                 ds = d.create_dataset(path, data=data, dtype=dtype)
                 for k, v in attrs.items():
@@ -461,7 +606,10 @@ def repack(job, desc, polarization, frequency, toFloat16):
                 g = d.require_group(path)
                 for k, v in attrs.items():
                     g.attrs[k] = v
-            reattachScales(d, grid, polarization)
+            if desc['product'] == 'GCOV':
+                reattachScales(d, grid, polarization)
+            else:
+                reattachScalesFromSource(s, d)
         if job['factorPath'] is not None and not os.path.exists(job['factorPath']):
             ftmp = job['factorPath'] + '.partial'
             with h5py.File(ftmp, 'w') as fd:
@@ -472,8 +620,20 @@ def repack(job, desc, polarization, frequency, toFloat16):
     os.replace(tmp, outPath)
 
 
+def verifySlimRequired(outPath, desc, polarization, frequency):
+    '''ROFF/RUNW gates: every dataset the GrIMP workflow reads (desc['required']) is present.'''
+    grid = desc['grid'].format(f=frequency)
+    pol = desc['polPath'].format(grid=grid, pol=polarization)
+    with h5py.File(outPath, 'r') as h:
+        needs = [n.format(grid=grid, pol=pol, p=polarization, root=desc['root'])
+                 for n in desc['required']]
+        return [f'missing {n}' for n in needs if n not in h]
+
+
 def verifySlim(outPath, factorPath, desc, polarization, frequency):
     '''Gates that must hold before an original could ever be deleted.'''
+    if 'required' in desc:
+        return verifySlimRequired(outPath, desc, polarization, frequency)
     grid = desc['grid'].format(f=frequency)
     problems = []
     with h5py.File(outPath, 'r') as h:
@@ -500,9 +660,17 @@ def verifySlim(outPath, factorPath, desc, polarization, frequency):
                 # stronger than "not too close to the floor": no valid pixel should be under
                 # it at all. One that is means the clamp did not run -- a file written before
                 # it existed, or a path that bypassed copyDataset.
+                # A granule written before the clamp has no grimpFlooredToF16Floor count. Its
+                # sub-floor pixels are expected, not a fault, so it gets a note rather than a
+                # failure; reconverting it applies the floor.
                 if v.size and v.min() < F16FLOOR:
-                    problems.append(f'min valid {v.min():.3g} is below F16FLOOR '
-                                    f'({F16FLOOR:.2e}); written before the floor clamp?')
+                    if 'grimpFlooredToF16Floor' in g.attrs:
+                        problems.append(f'min valid {v.min():.3g} is below F16FLOOR '
+                                        f'({F16FLOOR:.2e}) although the clamp ran')
+                    else:
+                        print(f'  note: {os.path.basename(outPath)} predates the F16FLOOR '
+                              f'clamp (min valid {v.min():.3g}); reconvert to apply it',
+                              flush=True)
                 nInf = int((inMask & np.isinf(a)).sum())
                 if nInf:
                     problems.append(f'{nInf} inf pixels inside the valid mask '
@@ -643,11 +811,11 @@ def fetchOne(url, args, desc, session, claimed):
 
     fh.cache.fetcher = record
     h = h5py.File(fh, 'r')
-    shareFactor = not args.noShareFactor
+    shareFactor = not args.noShareFactor and desc['shared'] is not None
     chunked, small, groups = keptDatasets(h, desc, args.polarization, args.frequency,
                                           shareFactor)
     grid = desc['grid'].format(f=args.frequency)
-    key, sig = gridKey(h, grid)
+    key, sig = gridKey(h, grid) if shareFactor else (None, None)
     tf = trackFrameKey(stem)
     factorPath = None
     if shareFactor:
@@ -669,7 +837,7 @@ def fetchOne(url, args, desc, session, claimed):
     runBytes = sum(b - a for a, b in runs)
     print('  {}: {} runs, {:.2f} GB of {:.2f} GB{}'.format(
         stem[-34:], len(runs), runBytes / 1e9, size / 1e9,
-        '' if needFactor else ' (factor reused)'), flush=True)
+        ' (factor reused)' if shareFactor and not needFactor else ''), flush=True)
     if args.check:
         return None
     sparse = scratchPath(args.tmpDir, stem)
@@ -718,17 +886,20 @@ def convertOne(path, args, desc, claimed):
         return None
     grid = desc['grid'].format(f=args.frequency)
     with h5py.File(path, 'r') as h:
-        pol = f'{grid}/{args.polarization}'
+        pol = desc['polPath'].format(grid=grid, pol=args.polarization)
         if pol not in h:
             print(f'  skipping {stem[-34:]}: no {args.polarization}', flush=True)
             return None
-        if h[pol].dtype == np.float16:
+        if desc['product'] == 'GCOV' and h[pol].dtype == np.float16:
             print(f'  skipping {stem[-34:]}: already float16', flush=True)
             return None
-        shareFactor = not args.noShareFactor
+        if 'slimMarker' in desc and desc['slimMarker'].format(pol=pol) not in h:
+            print(f'  skipping {stem[-34:]}: already slim', flush=True)
+            return None
+        shareFactor = not args.noShareFactor and desc['shared'] is not None
         chunked, small, groups = keptDatasets(h, desc, args.polarization, args.frequency,
                                               shareFactor)
-        key, sig = gridKey(h, grid)
+        key, sig = gridKey(h, grid) if shareFactor else (None, None)
     tf = trackFrameKey(stem)
     factorPath = None
     if shareFactor:
@@ -740,7 +911,7 @@ def convertOne(path, args, desc, claimed):
     if needFactor:
         claimed.add(factorPath)
         chunked = chunked + [(f'{grid}/{desc["shared"]}', True)]
-    elif not shareFactor:
+    elif desc['shared'] is not None and not shareFactor:
         chunked = chunked + [(f'{grid}/{desc["shared"]}', True)]
     return dict(stem=stem, sparse=path, outPath=outPath,
                 factorPath=factorPath if needFactor else None,
@@ -786,10 +957,13 @@ def repackOne(job, args, desc):
 def main():
     args = downloadNISARoptimizedArgs()
     desc = PRODUCTS[args.product]
+    if args.polarization is None:
+        args.polarization = desc['polarization']
     if args.factorDir is None:
         args.factorDir = os.path.join(args.outputDir, 'factors')
     os.makedirs(args.outputDir, exist_ok=True)
-    os.makedirs(args.factorDir, exist_ok=True)
+    if desc['shared'] is not None:
+        os.makedirs(args.factorDir, exist_ok=True)
     if not args.local:
         args.tmpDir = chooseTmpDir(args)
     urls = [u.strip() for u in open(args.urls) if u.strip()]
@@ -802,9 +976,12 @@ def main():
                     % (len(bad), len(urls)))
     if args.maxGranules:
         urls = urls[:args.maxGranules]
-    print('{} granules, output {}, factors {}, {}'.format(
-        len(urls), args.outputDir, args.factorDir,
-        'float32' if args.float32 else 'float16'), flush=True)
+    lossy = ('float32' if args.float32 else
+             'float16' if desc['lossy'] == 'float16' else
+             '{}-bit mantissa'.format(desc['mantissaBits']))
+    print('{} {} granules, output {}, {}{}'.format(
+        len(urls), args.product, args.outputDir,
+        f'factors {args.factorDir}, ' if desc['shared'] is not None else '', lossy), flush=True)
 
     session = requests.Session()                # trust_env -> ~/.netrc
     manifest = os.path.join(args.outputDir, 'slimManifest.jsonl')

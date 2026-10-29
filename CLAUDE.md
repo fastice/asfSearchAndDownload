@@ -13,7 +13,7 @@ Search the ASF DAAC for NISAR / Sentinel-1 products, dedupe against a local arch
 | `refreshS1Orbits` | `refreshOrbits.py:main()` | Refresh the precise-orbit (EOF) archive from ASF `aux_poeorb` |
 | `fileS1` | `fileS1.py:main()` | Unpack S1 SAFE zips into the `assemblyDir` `track-<n>/<orbit>/` tree |
 | `checkFramesS1` | `checkFramesS1.py:main()` | Vet filed datatakes (burst "frames"), restructure, and queue → toProcess/pending/problem |
-| `downloadNISARoptimized` | `downloadNISARoptimized.py:main()` | Fetch NISAR products keeping only the datasets the GrIMP tools read, as float16, with a shared RTC factor |
+| `downloadNISARoptimized` | `downloadNISARoptimized.py:main()` | Fetch NISAR products keeping only the datasets the GrIMP tools read: GCOV as float16 with a shared RTC factor, ROFF/RUNW without unused bands, with 10-bit-mantissa (RUNW phase 12-bit) float32 layers |
 | `downloadRSLCSubset` | `downloadRSLCSubset.py:main()` | Fetch a spatial subset of a NISAR RSLC as a slim RSLC with cropped, self-consistent geometry |
 | `logNetworkUse` | `networkLog.py:main()` | Log a finished `aria2c -i` session (shell scripts) to `~/networkLogs/networkLog.<host>` |
 | `networkMonitor` | `networkLog.py:monitorMain()` | Cron (every minute): internet-interface (default-route) traffic to `~/networkLogs/interfaceLog.<host>` |
