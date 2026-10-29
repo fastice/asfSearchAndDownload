@@ -8,8 +8,10 @@ downloadNISARoptimized - fetch NISAR products keeping only what the GrIMP tools 
 A NISAR GCOV is ~3 GB and carries ~280 datasets; geomosaic reads five of them, and
 numberOfLooks alone is 26% of the file. This fetches only the byte ranges the kept datasets
 occupy, over parallel HTTP range requests, writes a slim HDF5 with the same internal paths
-(so geomosaic reads it unchanged), converts the two big float bands to float16, and stores
-rtcGammaToSigmaFactor once per track/frame/grid so later cycles reuse it.
+(so geomosaic reads it unchanged), converts the two big float bands to float16 (saturating at
+both ends: 65504 above, and -40 dB below, 15 dB under the noise floor, so nothing underflows
+to zero and gets dropped), and stores rtcGammaToSigmaFactor once per track/frame/grid so later
+cycles reuse it.
 
 Measured on one Antarctic granule, against 3.06 GB / 172 s for the whole product:
   first cycle  1.95 GB / 119 s   (the factor has to be fetched)
@@ -76,6 +78,19 @@ REFERENCE_ATTRS = ('DIMENSION_LIST', 'REFERENCE_LIST', 'CLASS', 'NAME')
 # silently removes pixels rather than perturbing them, which no dB tolerance would catch.
 F16MAX = 65504.0
 F16MINNORMAL = 6.104e-5
+# Floor the small end at -40 dB instead of letting it underflow. NISAR's noise floor is
+# around -25 dB, so -40 dB is already 15 dB of margin below anything measured; what sits
+# below it is water, radar shadow and processing residue, and on a sampled 34.9 M valid
+# pixels 0.065% fell under float16's subnormal floor (-72 dB) where they flush to zero and
+# geomosaic then DROPS them -- speckled holes in exactly the dark areas, and concentrated at
+# the FRAME EDGES, where the last rows decay toward 1e-16: 26% of the valid pixels in the
+# bottom row block of a cycle-030 frame, against 1 in 10 M mid-frame. That is a feathering
+# seam losing coverage, not uniform speckle. Saturating is the same choice already made at
+# the ceiling, and for the same reason: a clamped value is an honest "below the noise floor",
+# a dropped pixel is a coverage change no dB comparison catches. 1e-4 is a normal float16, so
+# it stores exactly and the subnormal range (another 0.138% of pixels, at reduced precision)
+# stops being used at all.
+F16FLOOR = 1.0e-4
 
 # Per-product descriptor. GCOV is the only one implemented; the shape is here so RSLC, RUNW
 # and ROFF can be added without touching the fetch/repack machinery.
@@ -363,6 +378,7 @@ def copyDataset(src, dst, path, toFloat16, step=4096):
                                compression=src.compression,
                                compression_opts=src.compression_opts, shuffle=src.shuffle)
         nClamped = 0
+        nFloored = 0
         for y in range(0, src.shape[0], step):
             block = src[y:y + step]
             # Clamp before casting. A finite float32 above float16's 65504 ceiling (+48 dB)
@@ -375,6 +391,13 @@ def copyDataset(src, dst, path, toFloat16, step=4096):
             if over.any():
                 nClamped += int(over.sum())
                 block = np.where(over, np.sign(block) * F16MAX, block)
+            # Same treatment at the other end -- see F16FLOOR. An exact zero is left alone:
+            # it is already how the product says "nothing here", and raising it to -40 dB
+            # would invent signal rather than preserve it.
+            under = np.isfinite(block) & (block != 0) & (np.abs(block) < F16FLOOR)
+            if under.any():
+                nFloored += int(under.sum())
+                block = np.where(under, np.sign(block) * F16FLOOR, block)
             # .astype('f2') FIRST, deliberately. Assigning the float32 array straight into an
             # f2 dataset looks tidier but makes HDF5 do the conversion, which is its generic
             # software path: measured 2.433 s against 1.059 s per 16 Mpx block. numpy uses the
@@ -382,6 +405,7 @@ def copyDataset(src, dst, path, toFloat16, step=4096):
             # read side hits - see gcovMosaic.c's float16 fast path.
             d[y:y + step] = block.astype('f2')
         d.attrs['grimpClampedToF16Max'] = nClamped
+        d.attrs['grimpFlooredToF16Floor'] = nFloored
     elif src.chunks is not None:
         d = dst.create_dataset(path, shape=src.shape, dtype=src.dtype, chunks=src.chunks,
                                compression=src.compression,
@@ -466,19 +490,19 @@ def verifySlim(outPath, factorPath, desc, polarization, frequency):
             if m is not None:
                 inMask = (m[:n] == 1)
                 v = a[inMask & np.isfinite(a) & (a > 0)]
-                # Both float16 ends, symmetrically. Under the floor a value flushes to zero;
-                # over the ceiling it casts to inf. geomosaic drops both, so each is a
-                # coverage change rather than a value error, and neither shows up in a dB
-                # comparison. Checking only the floor is how the overflow end went unnoticed.
-                # Threshold sits just above the SUBNORMAL floor (5.96e-8), not above the min
-                # normal. Between the two, float16 still represents the value with reduced
-                # precision - it is not lost - so flagging there is a false positive. A first
-                # cut at 1e-6 flagged a granule whose true minimum round-tripped at 0.000 dB
-                # with zero pixels below the floor, and a failure line that cries wolf gets
-                # ignored.
-                if v.size and v.min() < 1e-7:
-                    problems.append(f'min valid {v.min():.3g} at the float16 floor '
-                                    f'({F16MINNORMAL:.2e} normal, 5.96e-08 subnormal)')
+                # Both float16 ends, symmetrically. These used to be the dangerous ends of the
+                # range -- under the subnormal floor a value flushed to zero, over the ceiling
+                # it cast to inf, and geomosaic drops both, so each was a coverage change
+                # rather than a value error and neither showed up in a dB comparison. Checking
+                # only the floor is how the overflow end went unnoticed.
+                #
+                # The small end is now clamped to F16FLOOR on write, so the invariant is
+                # stronger than "not too close to the floor": no valid pixel should be under
+                # it at all. One that is means the clamp did not run -- a file written before
+                # it existed, or a path that bypassed copyDataset.
+                if v.size and v.min() < F16FLOOR:
+                    problems.append(f'min valid {v.min():.3g} is below F16FLOOR '
+                                    f'({F16FLOOR:.2e}); written before the floor clamp?')
                 nInf = int((inMask & np.isinf(a)).sum())
                 if nInf:
                     problems.append(f'{nInf} inf pixels inside the valid mask '
