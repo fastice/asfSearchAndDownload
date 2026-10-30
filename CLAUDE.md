@@ -13,7 +13,7 @@ Search the ASF DAAC for NISAR / Sentinel-1 products, dedupe against a local arch
 | `refreshS1Orbits` | `refreshOrbits.py:main()` | Refresh the precise-orbit (EOF) archive from ASF `aux_poeorb` |
 | `fileS1` | `fileS1.py:main()` | Unpack S1 SAFE zips into the `assemblyDir` `track-<n>/<orbit>/` tree |
 | `checkFramesS1` | `checkFramesS1.py:main()` | Vet filed datatakes (burst "frames"), restructure, and queue → toProcess/pending/problem |
-| `downloadNISARoptimized` | `downloadNISARoptimized.py:main()` | Fetch NISAR products keeping only the datasets the GrIMP tools read: GCOV as float16 with a shared RTC factor; ROFF/RUNW/GOFF/GUNW without unused bands (GUNW also without `wrappedInterferogram`), float32 rasters rounded to `--mantissaBits` (10; `--phaseBits` 12), float64 cubes to `--geometryBits` 30 / `--correctionBits` 23, float32 cubes exact, everything compressed. `--dropBands`/`--addBands` override the defaults, which `--help` lists |
+| `downloadNISARoptimized` | `downloadNISARoptimized.py:main()` | Fetch NISAR products keeping only the datasets the GrIMP tools read: GCOV float32 (`--float16` for the GrIMP mosaics) with a shared RTC factor; ROFF/RUNW/GOFF/GUNW without unused bands (GUNW also without `wrappedInterferogram`), float32 rasters rounded to `--mantissaBits` (10; `--phaseBits` 12), float64 cubes to `--geometryBits` 30 / `--correctionBits` 23, float32 cubes exact, everything compressed. `--dropBands`/`--addBands` override the defaults, which `--help` lists |
 | `downloadRSLCSubset` | `downloadRSLCSubset.py:main()` | Fetch a spatial subset of a NISAR RSLC as a slim RSLC with cropped, self-consistent geometry |
 | `logNetworkUse` | `networkLog.py:main()` | Log a finished `aria2c -i` session (shell scripts) to `~/networkLogs/networkLog.<host>` |
 | `networkMonitor` | `networkLog.py:monitorMain()` | Cron (every minute): internet-interface (default-route) traffic to `~/networkLogs/interfaceLog.<host>` |
@@ -52,7 +52,7 @@ searchASF firstDate lastDate output
           [--startTrack N] [--endTrack N]
           [--startFrame N] [--endFrame N]
           [--searchArea FILE | --greenland | --antarctica]
-          [--archiveDir GLOB] [--gpkg FILE] [--s3]
+          [--archiveDir PATTERN] [--gpkg FILE] [--s3]
 ```
 
 - **Dates**: `firstDate`/`lastDate` are `YYYY-MM-DD`; converted to `T00:00:00Z`/`T23:59:59Z` for the CMR temporal filter.
@@ -60,7 +60,7 @@ searchASF firstDate lastDate output
 - **Bandwidth** (`--bandwidth`, NISAR only): `5 5+5 20 20+5 40 40+5 77` MHz; only applied as a hard filter for pair products (`RIFG RUNW ROFF GUNW GOFF`, see `_PAIR_PRODUCTS`) — single-acquisition products (RSLC, GSLC, GCOV, L0B, SME2) are searched without it.
 - **Search area** (`--searchArea`): accepts `.geojson`/`.json` (FeatureCollection/Feature/Geometry), `.shp` (reprojected to WGS84 via OGR), or a flat GrIMP `.lonlat` file (`lon,lat` pairs, order auto-detected). `--greenland` uses the bundled `asfsearchdownload/searchRegions/Greenland.lonlat` (also the default). `--antarctica` uses a hardcoded circumpolar WKT and is mutually exclusive with `--greenland`.
 - **Track/frame filters**: `--startTrack/--endTrack/--startFrame/--endFrame` filter on `pathNumber`/`frameNumber` from the search result (or parsed from the NISAR_EA granule name).
-- **Archive dedup** (`--archiveDir GLOB`): globs existing files (extensions `.h5`/`.zip`/`.zip.1` stripped for comparison). Sentinel-1 dedupes by filename stem; NISAR dedupes by `scene_key` (granule identity minus CRID/version) and tracks the highest CRID version seen — older-or-equal granules go to `<output>.exists`, newer versions go to `<output>.updated`.
+- **Archive dedup** (`--archiveDir PATTERN`, a wildcard path): lists existing files (extensions `.h5`/`.zip`/`.zip.1` stripped for comparison). Sentinel-1 dedupes by filename stem; NISAR dedupes by `scene_key` (granule identity minus CRID/version) and tracks the highest CRID version seen — older-or-equal granules go to `<output>.exists`, newer versions go to `<output>.updated`.
 - **`--gpkg FILE`**: writes one OGR layer per NISAR product type, with a `status` field (`found`/`exists`/`updated`) and metadata parsed by `parse_nisar_meta()` (track, frame, cycle, direction, polarization, bandwidth_mhz, dates, crid, version). EPSG chosen automatically from mean footprint latitude: `3031` (Antarctic, lat < -60), `3413` (Arctic, lat > 60), else `4326`.
 - **`--s3`**: emit `s3://` URIs instead of HTTPS; granules with no S3 link are silently skipped.
 

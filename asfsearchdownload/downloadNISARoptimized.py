@@ -73,6 +73,11 @@ UNTAGGED_STALE_SECONDS = 86400
 # address, so a reader that consults dimension scales can silently get the wrong axis.
 REFERENCE_ATTRS = ('DIMENSION_LIST', 'REFERENCE_LIST', 'CLASS', 'NAME')
 
+# Slim granules and factors are written with the paged file-space layout the archive products
+# use (2 MiB pages). The NISAR GDAL plugin opens files with an HDF5 page buffer and refuses
+# non-paged ones ("H5Fopen failed ... Ensure metadata fits in 8MiB"); paging costs 2-4% in size.
+PAGED = dict(fs_strategy='page', fs_persist=True, fs_page_size=2 * 1024 * 1024)
+
 # float16 limits. Both ends matter and in different ways: below the subnormal floor a value
 # flushes to zero, above the ceiling it casts to inf, and geomosaic DROPS both - so either end
 # silently removes pixels rather than perturbing them, which no dB tolerance would catch.
@@ -304,9 +309,10 @@ def defaultBandsHelp():
                            ('dropCubes', 'drops cubes')):
             if desc.get(key):
                 lines.append(f'    {label + ":":13s} {" ".join(desc[key])}')
-        if desc['lossy'] == 'float16':
-            lines.append(f'    {"reduces:":13s} {desc["polarization"]} and {desc["shared"]} to '
-                         f'float16 ({desc["shared"]} stored once per track/frame/grid)')
+        if desc['product'] == 'GCOV':
+            lines.append(f'    {"rounds:":13s} {desc["polarization"]} and {desc["shared"]} to '
+                         f'--mantissaBits (float16 with --float16); {desc["shared"]} stored '
+                         'once per track/frame/grid')
         elif 'lossyGroups' in desc:
             phase = ' '.join(desc.get('phaseBands', ()))
             lines.append(f'    {"rounds:":13s} every float32 raster to --mantissaBits'
@@ -341,8 +347,8 @@ def downloadNISARoptimizedArgs():
                              'keep [HHHH for GCOV, HH otherwise]')
     parser.add_argument('--frequency', type=str, default='A', help='A or B [A]')
     parser.add_argument('--mantissaBits', type=int, default=DEFAULT_MANTISSA_BITS,
-                        help='mantissa bits (of 23) kept on ROFF/RUNW/GOFF/GUNW float32 rasters '
-                             f'(GCOV uses float16) [{DEFAULT_MANTISSA_BITS}]')
+                        help='mantissa bits (of 23) kept on float32 rasters, GCOV included '
+                             f'unless --float16 [{DEFAULT_MANTISSA_BITS}]')
     parser.add_argument('--phaseBits', type=int, default=None,
                         help='mantissa bits (of 23) kept on unwrappedPhase (RUNW/GUNW) '
                              f'[mantissaBits + {PHASE_EXTRA_BITS}]')
@@ -358,9 +364,16 @@ def downloadNISARoptimizedArgs():
     parser.add_argument('--addBands', type=str, nargs='+', default=[],
                         help='keep these even though the product defaults drop them (e.g. '
                              'wrappedInterferogram for GUNW, snr for ROFF)')
+    parser.add_argument('--box', type=float, nargs=4, default=None,
+                        metavar=('LONMIN', 'LATMIN', 'LONMAX', 'LATMAX'),
+                        help='GCOV/GOFF/GUNW only: fetch and keep only this lon/lat box; writes '
+                             '<granule>.subset.h5 and skips granules the box misses')
+    parser.add_argument('--float16', action='store_true',
+                        help='GCOV only: store HHHH and the RTC factor as float16, clamped to '
+                             '[1e-4, 65504] (what the GrIMP mosaics use); default float32 '
+                             'rounded to --mantissaBits')
     parser.add_argument('--float32', action='store_true',
-                        help='keep the float bands at full precision (no float16 for GCOV, '
-                             'no mantissa rounding otherwise)')
+                        help='keep the float bands at full precision (no rounding, no float16)')
     parser.add_argument('--noShareFactor', action='store_true',
                         help='store the RTC factor in each granule instead of sharing it')
     parser.add_argument('--connections', type=int, default=16,
@@ -381,6 +394,17 @@ def downloadNISARoptimizedArgs():
                              'downloading. Originals are never touched, so --outputDir must '
                              'differ from where they live.')
     args = parser.parse_args()
+    if args.box is not None:
+        if args.product not in BOX_PRODUCTS:
+            parser.error(f'--box applies to {"/".join(BOX_PRODUCTS)} only')
+        lon0, lat0, lon1, lat1 = args.box
+        if not (lon0 < lon1 and lat0 < lat1):
+            parser.error('--box is LONMIN LATMIN LONMAX LATMAX')
+        args.noShareFactor = True       # a cropped factor is per-granule, not per position
+    if args.float16 and args.product != 'GCOV':
+        parser.error('--float16 applies to GCOV only')
+    if args.float16 and args.float32:
+        parser.error('--float16 and --float32 are exclusive')
     if args.phaseBits is None:
         args.phaseBits = min(23, args.mantissaBits + PHASE_EXTRA_BITS)
     for name, top in (('mantissaBits', 23), ('phaseBits', 23), ('geometryBits', 52),
@@ -388,6 +412,15 @@ def downloadNISARoptimizedArgs():
         if not 1 <= getattr(args, name) <= top:
             parser.error(f'--{name} must be 1..{top}')
     return args
+
+
+def factorTag(args, desc):
+    '''Suffix on a shared factor's file name for its precision. float16 keeps the original
+    (untagged) name so factors already written for the GrIMP downloads are still reused; a
+    float32 granule never picks up a float16 factor or one rounded differently.'''
+    if desc['lossy'] == 'float16' and not args.float32:
+        return ''
+    return '_f32' if args.float32 else f'_m{args.mantissaBits}'
 
 
 def roundingBits(args):
@@ -511,6 +544,8 @@ def isLossy(path, obj, desc, grid, polarization):
         groups = [g.format(grid=grid, root=desc['root']) for g in desc['lossyGroups']]
         return (obj.dtype == np.float32 and obj.ndim >= 2
                 and any(path.startswith(g) for g in groups))
+    if desc['product'] == 'GCOV':
+        return path in (f'{grid}/{polarization}', f'{grid}/{desc["shared"]}')
     if desc['lossy'] == 'mantissa':
         return (path.startswith(desc['polPath'].format(grid=grid, pol=polarization) + '/')
                 and os.path.basename(path) in desc['mantissaLayers'])
@@ -528,6 +563,179 @@ def roundMantissa(x, keep):
     mask = uint((int(np.iinfo(uint).max) >> drop) << drop)
     r = (bits + uint(1 << (drop - 1))) & mask
     return np.where(np.isfinite(x), r, bits).astype(uint).view(x.dtype)
+
+
+BOX_PRODUCTS = ('GCOV', 'GOFF', 'GUNW')
+
+
+class Window:
+    """Row/column window [r0, r1) x [c0, c1) of one geocoded grid of ny x nx."""
+
+    def __init__(self, r0, r1, c0, c1, ny, nx):
+        self.r0, self.r1, self.c0, self.c1, self.ny, self.nx = r0, r1, c0, c1, ny, nx
+
+    def asdict(self):
+        return dict(r0=self.r0, r1=self.r1, c0=self.c0, c1=self.c1)
+
+
+def boxWindows(h, desc, box, frequency):
+    """Windows of a lon/lat box in every geocoded grid of a G product, keyed by group path.
+
+    Each group holding xCoordinates/yCoordinates (the image grids, metadata/radarGrid, GCOV's
+    coarse calibration grids) gets its own window, from its own axes and EPSG, so grids of
+    different spacing stay consistent. Image-grid windows are widened to whole chunks, so the
+    subset keeps the archive's chunk alignment and every fetched chunk is used whole; the
+    coarse metadata grids get one cell of margin, so interpolation across the box still has
+    both neighbours. Returns None when the box misses the product's main grid.
+    """
+    from osgeo import osr
+    osr.UseExceptions()
+    root = desc['root']
+    grid = desc['grid'].format(f=frequency)
+    groups = []
+    h[root].visititems(lambda n, o: groups.append(f'{root}/{n}') if isinstance(o, h5py.Group)
+                       and 'xCoordinates' in o and 'yCoordinates' in o else None)
+    lon0, lat0, lon1, lat1 = box
+    t = np.linspace(0, 1, 50)
+    lons = np.concatenate([lon0 + (lon1 - lon0) * t, np.full(50, lon1),
+                           lon1 - (lon1 - lon0) * t, np.full(50, lon0)])
+    lats = np.concatenate([np.full(50, lat0), lat0 + (lat1 - lat0) * t,
+                           np.full(50, lat1), lat1 - (lat1 - lat0) * t])
+    ll = osr.SpatialReference()
+    ll.ImportFromEPSG(4326)
+    ll.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    windows = {}
+    for g in groups:
+        o = h[g]
+        if 'projection' not in o or 'epsg_code' not in o['projection'].attrs:
+            continue
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(int(o['projection'].attrs['epsg_code']))
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        xy = np.array(osr.CoordinateTransformation(ll, srs).TransformPoints(
+            np.column_stack([lons, lats])))
+        x, y = o['xCoordinates'][()], o['yCoordinates'][()]
+        cols = np.nonzero((x >= xy[:, 0].min()) & (x <= xy[:, 0].max()))[0]
+        rows = np.nonzero((y >= xy[:, 1].min()) & (y <= xy[:, 1].max()))[0]
+        if cols.size == 0 or rows.size == 0:
+            continue
+        r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+        if g.startswith(grid):
+            cy, cx = 1, 1
+            for k in o:
+                d = o[k]
+                if isinstance(d, h5py.Dataset) and d.chunks and d.shape == (y.size, x.size):
+                    cy, cx = d.chunks
+                    break
+            r0, c0 = r0 // cy * cy, c0 // cx * cx
+            r1, c1 = min(y.size, -(-r1 // cy) * cy), min(x.size, -(-c1 // cx) * cx)
+        else:
+            r0, c0 = max(0, r0 - 1), max(0, c0 - 1)
+            r1, c1 = min(y.size, r1 + 1), min(x.size, c1 + 1)
+        windows[g] = Window(int(r0), int(r1), int(c0), int(c1), y.size, x.size)
+    main = desc['polPath'].format(grid=grid, pol='').rstrip('/')
+    main = main if main in windows else grid
+    if main not in windows:
+        return None
+    windows['_main'] = windows[main]
+    return windows
+
+
+def datasetWindow(path, shape, windows):
+    """The window that applies to a raster or cube: its nearest enclosing grid group whose
+    axes match its last two dimensions. None for anything else."""
+    if not windows or len(shape) < 2:
+        return None
+    for g in sorted((k for k in windows if k != '_main'), key=len, reverse=True):
+        w = windows[g]
+        if path.startswith(g + '/') and tuple(shape[-2:]) == (w.ny, w.nx):
+            return w
+    return None
+
+
+def cropSmall(path, data, windows):
+    """Crop a grid's own xCoordinates / yCoordinates, and any small (unchunked) raster on that
+    grid, to its window."""
+    if not windows:
+        return data
+    w = datasetWindow(path, np.shape(data), windows)
+    if w is not None:
+        return np.asarray(data)[..., w.r0:w.r1, w.c0:w.c1]
+    g, name = path.rsplit('/', 1)
+    w = windows.get(g)
+    if w is not None and name == 'xCoordinates' and np.shape(data) == (w.nx,):
+        return data[w.c0:w.c1]
+    if w is not None and name == 'yCoordinates' and np.shape(data) == (w.ny,):
+        return data[w.r0:w.r1]
+    return data
+
+
+def keptPolarizationList(path, data, desc, grid, polarization):
+    """listOfCovarianceTerms / listOfPolarizations reduced to what the slim granule holds.
+
+    The archive lists every term or polarization it carries; a slim granule keeps one, and a
+    reader that trusts the list (the NISAR GDAL plugin validates POL against it, nisarhdf's GCOV
+    reader loads every listed term) would otherwise look for the ones that were dropped.
+    """
+    name = path.rsplit('/', 1)[-1]
+    if not path.startswith(grid + '/') or path.count('/') != grid.count('/') + 1:
+        return data
+    if name == 'listOfCovarianceTerms' and desc['product'] == 'GCOV':
+        keep = [polarization]
+    elif name == 'listOfPolarizations':
+        keep = sorted({polarization[:2], polarization[2:]} - {''}) \
+            if desc['product'] == 'GCOV' else [polarization]
+    else:
+        return data
+    data = np.asarray(data)
+    return np.array([k.encode() if data.dtype.kind == 'S' else k for k in keep], dtype=data.dtype)
+
+
+def subsetBoundingPolygon(h, windows, frequency, desc):
+    """WKT footprint of the subset's main grid, lon/lat at height 0, densified edges."""
+    from osgeo import osr
+    osr.UseExceptions()
+    grid = desc['grid'].format(f=frequency)
+    main = [g for g, w in windows.items() if g != '_main' and w is windows['_main']
+            and g.startswith(grid)][0]
+    w = windows['_main']
+    x = h[f'{main}/xCoordinates'][w.c0:w.c1]
+    y = h[f'{main}/yCoordinates'][w.r0:w.r1]
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(int(h[f'{main}/projection'].attrs['epsg_code']))
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    ll = osr.SpatialReference()
+    ll.ImportFromEPSG(4326)
+    ll.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    t = np.linspace(0, 1, 12)
+    xs = np.concatenate([x[0] + (x[-1] - x[0]) * t, np.full(12, x[-1]),
+                         x[-1] - (x[-1] - x[0]) * t, np.full(12, x[0])])
+    ys = np.concatenate([np.full(12, y[0]), y[0] + (y[-1] - y[0]) * t,
+                         np.full(12, y[-1]), y[-1] - (y[-1] - y[0]) * t])
+    pts = osr.CoordinateTransformation(srs, ll).TransformPoints(np.column_stack([xs, ys]))
+    ring = ','.join(f'{p[0]!r} {p[1]!r} 0.0' for p in pts)
+    ring += f',{pts[0][0]!r} {pts[0][1]!r} 0.0'
+    return f'POLYGON (({ring}))'
+
+
+class WindowedDataset:
+    """A dataset seen through a Window, for copyDataset: same dtype and filters, the chunk
+    shape clipped to the window, and reads served from the window."""
+
+    def __init__(self, ds, w):
+        self.sel = (Ellipsis, slice(w.r0, w.r1), slice(w.c0, w.c1))
+        self.data = None
+        self.ds = ds
+        self.shape = ds.shape[:-2] + (w.r1 - w.r0, w.c1 - w.c0)
+        self.chunks = tuple(min(c, n) for c, n in zip(ds.chunks, self.shape))
+        for k in ('dtype', 'compression', 'compression_opts', 'shuffle', 'fletcher32',
+                  'fillvalue', 'attrs'):
+            setattr(self, k, getattr(ds, k))
+
+    def __getitem__(self, key):
+        if self.data is None:
+            self.data = self.ds[self.sel]
+        return self.data[key]
 
 
 def keptDatasets(h, desc, polarization, frequency, shareFactor):
@@ -573,8 +781,9 @@ def keptDatasets(h, desc, polarization, frequency, shareFactor):
     return chunked, small, groups
 
 
-def planRanges(fh, h, chunked):
-    '''Byte ranges for the chunked datasets, plus whatever the open already touched.
+def planRanges(fh, h, chunked, windows=None):
+    '''Byte ranges for the chunked datasets, plus whatever the open already touched. With
+    box windows, only the chunks a dataset's window touches.
 
     Extents, not reads: asking HDF5 where a chunk lives costs nothing, while reading a
     20 MB incidence cube over HTTP in small pieces cost ~44 s per granule on its own.
@@ -582,8 +791,13 @@ def planRanges(fh, h, chunked):
     want = []
     for path, _ in chunked:
         d = h[path]
+        w = datasetWindow(path, d.shape, windows)
         for i in range(d.id.get_num_chunks()):
             ci = d.id.get_chunk_info(i)
+            if w is not None:
+                r, c = ci.chunk_offset[-2:]
+                if r >= w.r1 or r + d.chunks[-2] <= w.r0 or c >= w.c1 or c + d.chunks[-1] <= w.c0:
+                    continue
             want.append((ci.byte_offset, ci.byte_offset + ci.size))
     return want, list(fh._grimpRanges)
 
@@ -706,6 +920,11 @@ def copyDataset(src, dst, path, toFloat16, step=4096, mantissaBits=None):
                                fillvalue=src.fillvalue)
         for y in range(0, src.shape[0], step):
             d[y:y + step] = src[y:y + step]
+    elif isinstance(src, WindowedDataset):
+        d = dst.create_dataset(path, data=src[()], chunks=src.chunks,
+                               compression=src.compression,
+                               compression_opts=src.compression_opts, shuffle=src.shuffle,
+                               fillvalue=src.fillvalue)
     elif src.chunks is not None:
         d = dst.create_dataset(path, shape=src.shape, dtype=src.dtype, chunks=src.chunks,
                                compression=src.compression,
@@ -776,7 +995,7 @@ def repack(job, desc, polarization, frequency, toFloat16, bits):
     sharedPath = f'{grid}/{desc["shared"]}'
     outPath, tmp = job['outPath'], job['outPath'] + '.partial'
     with h5py.File(job['sparse'], 'r') as s:
-        with h5py.File(tmp, 'w') as d:
+        with h5py.File(tmp, 'w', **PAGED) as d:
             mantissa = desc['lossy'] == 'mantissa'
             for path, big in job['chunked']:
                 if path == sharedPath and job['shareFactor']:
@@ -788,10 +1007,16 @@ def repack(job, desc, polarization, frequency, toFloat16, bits):
                     keep = bits['phase']
                 else:
                     keep = bits['mantissa']
-                copyDataset(s[path], d, path, toFloat16 and big and not mantissa,
+                src = s[path]
+                w = datasetWindow(path, src.shape, job.get('windows'))
+                if w is not None:
+                    src = WindowedDataset(src, w)
+                copyDataset(src, d, path, toFloat16 and big and not mantissa,
                             mantissaBits=keep if toFloat16 and big and mantissa else None)
             for path, (data, attrs, dtype) in job['small'].items():
-                ds = d.create_dataset(path, data=data, dtype=dtype)
+                data = keptPolarizationList(path, data, desc, grid, polarization)
+                ds = d.create_dataset(path, data=cropSmall(path, data, job.get('windows')),
+                                      dtype=dtype)
                 for k, v in attrs.items():
                     ds.attrs[k] = v
             for path, attrs in job['groups'].items():
@@ -802,16 +1027,32 @@ def repack(job, desc, polarization, frequency, toFloat16, bits):
                 reattachScales(d, grid, polarization)
             else:
                 reattachScalesFromSource(s, d)
-                # What was done to it, and the mark --local uses to skip a slim granule
-                d.attrs['grimpSlim'] = json.dumps(dict(
-                    product=desc['product'], polarization=polarization,
-                    bits=None if not toFloat16 else bits,
-                    dropped=sorted(set(desc.get('dropGrids', ())) | set(desc.get('dropGroups', ()))
-                                   | set(desc.get('dropCubes', ())) | desc.get('userDrop', set()))))
+            if job.get('windows'):
+                # the subset's own footprint, and where it came from
+                bp = '/science/LSAR/identification/boundingPolygon'
+                if bp in d:
+                    attrs = dict(d[bp].attrs)
+                    del d[bp]
+                    ds = d.create_dataset(bp, data=np.bytes_(
+                        subsetBoundingPolygon(s, job['windows'], frequency, desc)))
+                    for k, v in attrs.items():
+                        ds.attrs[k] = v
+                d.attrs['subsetOf'] = job['stem']
+                d.attrs['subsetBox'] = json.dumps(job['box'])
+                d.attrs['subsetWindows'] = json.dumps(
+                    {g: w.asdict() for g, w in job['windows'].items() if g != '_main'})
+            # What was done to it, and the mark --local uses to skip a slim granule
+            d.attrs['grimpSlim'] = json.dumps(dict(
+                product=desc['product'], polarization=polarization,
+                precision='float32' if not toFloat16 else desc['lossy'],
+                bits=bits if toFloat16 and desc['lossy'] == 'mantissa' else None,
+                dropped=sorted(set(desc.get('dropGrids', ())) | set(desc.get('dropGroups', ()))
+                               | set(desc.get('dropCubes', ())) | desc.get('userDrop', set()))))
         if job['factorPath'] is not None and not os.path.exists(job['factorPath']):
             ftmp = job['factorPath'] + '.partial'
-            with h5py.File(ftmp, 'w') as fd:
-                copyDataset(s[sharedPath], fd, sharedPath, toFloat16)
+            with h5py.File(ftmp, 'w', **PAGED) as fd:
+                copyDataset(s[sharedPath], fd, sharedPath, toFloat16 and not mantissa,
+                            mantissaBits=bits['mantissa'] if toFloat16 and mantissa else None)
                 fd.attrs['gridKey'] = job['gridKey']
                 fd.attrs['gridSignature'] = job['gridSig']
             os.replace(ftmp, job['factorPath'])   # write once, never rewritten in place
@@ -846,7 +1087,7 @@ def verifySlim(outPath, factorPath, desc, polarization, frequency):
             m = h[f'{grid}/mask'] if f'{grid}/mask' in h else None
             n = min(4096, g.shape[0])
             a = g[:n]
-            if m is not None:
+            if m is not None and g.dtype == np.float16:
                 inMask = (m[:n] == 1)
                 v = a[inMask & np.isfinite(a) & (a > 0)]
                 # Both float16 ends, symmetrically. These used to be the dangerous ends of the
@@ -993,7 +1234,7 @@ def fetchOne(url, args, desc, session, claimed):
     if trackFrameKey(stem) is None:
         print(f'  skipping unparseable name {stem}', flush=True)
         return None
-    outPath = os.path.join(args.outputDir, stem + '.h5')
+    outPath = os.path.join(args.outputDir, stem + ('.subset.h5' if args.box else '.h5'))
     if os.path.exists(outPath):
         return None
     signed = resolvePresigned(url, session)
@@ -1014,6 +1255,13 @@ def fetchOne(url, args, desc, session, claimed):
     chunked, small, groups = keptDatasets(h, desc, args.polarization, args.frequency,
                                           shareFactor)
     grid = desc['grid'].format(f=args.frequency)
+    windows = None
+    if args.box:
+        windows = boxWindows(h, desc, args.box, args.frequency)
+        if windows is None:
+            print(f'  {stem[-34:]}: box does not intersect this granule, skipping', flush=True)
+            h.close()
+            return None
     key, sig = gridKey(h, grid) if shareFactor else (None, None)
     tf = trackFrameKey(stem)
     factorPath = None
@@ -1022,14 +1270,15 @@ def fetchOne(url, args, desc, session, claimed):
         # are name-anchored, and a factor swept up as an input aborts the whole tile.
         factorPath = os.path.join(
             args.factorDir,
-            'rtcFactor_{}_{}_{}_{}_{}_{}.h5'.format(tf[0], tf[1], tf[2], tf[3], tf[4], key))
+            'rtcFactor_{}_{}_{}_{}_{}_{}{}.h5'.format(tf[0], tf[1], tf[2], tf[3], tf[4], key,
+                                                      factorTag(args, desc)))
     needFactor = (shareFactor and not os.path.exists(factorPath)
                   and factorPath not in claimed)
     if needFactor:
         claimed.add(factorPath)
     if needFactor:
         chunked = chunked + [(f'{grid}/{desc["shared"]}', True)]
-    want, meta = planRanges(fh, h, chunked)
+    want, meta = planRanges(fh, h, chunked, windows)
     size = fh.size
     h.close()
     runs = coalesce(want + meta, 1 << 20, size)
@@ -1066,7 +1315,8 @@ def fetchOne(url, args, desc, session, claimed):
                           if shareFactor else None),
                 factorTarget=os.path.basename(factorPath) if shareFactor else None,
                 chunked=chunked, small=small, groups=groups,
-                gridKey=key, gridSig=sig, shareFactor=shareFactor)
+                gridKey=key, gridSig=sig, shareFactor=shareFactor,
+                windows=windows, box=args.box)
 
 
 def convertOne(path, args, desc, claimed):
@@ -1080,7 +1330,7 @@ def convertOne(path, args, desc, claimed):
     stem = granuleStem(path)
     if trackFrameKey(stem) is None:
         return None
-    outPath = os.path.join(args.outputDir, stem + '.h5')
+    outPath = os.path.join(args.outputDir, stem + ('.subset.h5' if args.box else '.h5'))
     if os.path.exists(outPath):
         return None
     grid = desc['grid'].format(f=args.frequency)
@@ -1099,27 +1349,36 @@ def convertOne(path, args, desc, claimed):
         shareFactor = not args.noShareFactor and desc['shared'] is not None
         chunked, small, groups = keptDatasets(h, desc, args.polarization, args.frequency,
                                               shareFactor)
+        windows = None
+        if args.box:
+            windows = boxWindows(h, desc, args.box, args.frequency)
+            if windows is None:
+                print(f'  {stem[-34:]}: box does not intersect this granule, skipping',
+                      flush=True)
+                return None
         key, sig = gridKey(h, grid) if shareFactor else (None, None)
     tf = trackFrameKey(stem)
     factorPath = None
     if shareFactor:
         factorPath = os.path.join(
             args.factorDir,
-            'rtcFactor_{}_{}_{}_{}_{}_{}.h5'.format(tf[0], tf[1], tf[2], tf[3], tf[4], key))
+            'rtcFactor_{}_{}_{}_{}_{}_{}{}.h5'.format(tf[0], tf[1], tf[2], tf[3], tf[4], key,
+                                                      factorTag(args, desc)))
     needFactor = (shareFactor and not os.path.exists(factorPath)
                   and factorPath not in claimed)
     if needFactor:
         claimed.add(factorPath)
         chunked = chunked + [(f'{grid}/{desc["shared"]}', True)]
-    elif desc['shared'] is not None and not shareFactor:
-        chunked = chunked + [(f'{grid}/{desc["shared"]}', True)]
+    # (without sharing, keptDatasets already lists the factor; adding it again made the
+    # repack create it twice and fail)
     return dict(stem=stem, sparse=path, outPath=outPath,
                 factorPath=factorPath if needFactor else None,
                 linkPath=(os.path.join(args.factorDir, stem + '.h5')
                           if shareFactor else None),
                 factorTarget=os.path.basename(factorPath) if shareFactor else None,
                 chunked=chunked, small=small, groups=groups,
-                gridKey=key, gridSig=sig, shareFactor=shareFactor, keepSource=True)
+                gridKey=key, gridSig=sig, shareFactor=shareFactor, keepSource=True,
+                windows=windows, box=args.box)
 
 
 def repackOne(job, args, desc):
@@ -1158,6 +1417,8 @@ def repackOne(job, args, desc):
 def main():
     args = downloadNISARoptimizedArgs()
     desc = applyBandOverrides(PRODUCTS[args.product], args.dropBands, args.addBands)
+    if desc['product'] == 'GCOV':
+        desc['lossy'] = 'float16' if args.float16 else 'mantissa'
     if args.polarization is None:
         args.polarization = desc['polarization']
     if args.factorDir is None:
@@ -1178,7 +1439,7 @@ def main():
     if args.maxGranules:
         urls = urls[:args.maxGranules]
     lossy = ('float32' if args.float32 else
-             'float16' if desc['lossy'] == 'float16' else
+             'float16 (GCOV)' if desc['lossy'] == 'float16' else
              'mantissa bits {mantissa}, phase {phase}, geometry {geometry}, correction '
              '{correction}'.format(**roundingBits(args)))
     print('{} {} granules, output {}, {}{}'.format(

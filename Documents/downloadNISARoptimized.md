@@ -1,17 +1,73 @@
 # downloadNISARoptimized
 
-Fetch NISAR **GCOV, ROFF, RUNW, GOFF and GUNW** products keeping only the datasets the
-GrIMP tools read: GCOV as float16 with the RTC factor stored once per track/frame/grid, the
-others as float32 rounded to 10 mantissa bits. Internal paths are unchanged, so every reader
-(`geomosaic`, `nisarhdf`, GDAL) opens a slim product as it would the full one. Part of the
-`asfSearchAndDownload` package. Replaces the whole-product `aria2c` fetch, and is what the
-nightly `autoupdateNISAR` uses for RUNW/ROFF (and GUNW/GOFF, if a project lists them).
+Download NISAR **GCOV, ROFF, RUNW, GOFF and GUNW** products as *slim* copies: the same HDF5
+files, with the same internal paths, but holding only the bands you need, stored compactly. You
+give it a plain text file of HTTPS links to the granules, from any source (see *Telling it what
+to download*). Part of the `asfSearchAndDownload` package.
+
+### Why use it
+
+NISAR products are large, and much of each file is something a given analysis never reads:
+
+- **Bands you do not use.** A GUNW carries a full-resolution wrapped interferogram and its own
+  coherence alongside the unwrapped products -- about half of a 1.7 GB granule. ROFF carries
+  three variance layers, an SNR layer and a DEM; in a GCOV the number-of-looks band alone is
+  about a quarter of the file; and most products carry a DEM or metadata cubes that are only
+  sometimes needed.
+- **Precision you cannot use.** Bands are stored as float32 (24 significant bits), far beyond
+  the precision of the measurements, and that extra noise in the low bits is what keeps them from
+  compressing well. Rounding to 10 mantissa bits (a relative error of at most 4.9e-4, which in
+  the processing tested below stayed well under the noise of the measurements; see *Rounding
+  errors*) lets the same compression shrink the bands severalfold.
+
+This tool removes both -- the unneeded bands before they cross the network, the excess
+precision after:
+
+- **Smaller downloads.** It reads the archive product's index over HTTP and fetches only the
+  byte ranges of the bands it keeps, so unneeded bands are never transferred. A 40 MHz GUNW
+  transfers 0.92 GB instead of 1.69 GB; a 77 MHz ROFF 0.23 GB instead of 0.49 GB. The bands it
+  keeps arrive as the archive stores them, at full precision: rounding cannot be done on the
+  server, so it saves storage, not transfer.
+- **Much less storage.** Once fetched, the kept bands are rounded and recompressed, so the files
+  on disk are 3-5x smaller than the archive products (for example GUNW 1690 MB -> 371 MB, ROFF 1065 MB ->
+  233 MB, GCOV 4572 MB -> 1078 MB). Over a regional archive of thousands of granules, that is the
+  difference between tens of terabytes and a few.
+- **Only the area you need.** For the geocoded products (GCOV, GOFF, GUNW), `--box` fetches just
+  a lon/lat box of each granule -- a 1.2 x 0.5 degree box of a GUNW is 23 MB.
+- **Nothing to change downstream.** Paths, chunking and attributes are those of the archive
+  product, so `nisarhdf`, h5py, GDAL's HDF5 driver and the NISAR GDAL plugin read a slim file as
+  they would the full one.
+
+What you give up: the bands you drop are not on disk (keep any of them with `--addBands`, or
+choose your own with `--dropBands`), and the rounded bands differ from the archive values by the
+amounts in *Rounding errors* (or keep full precision with `--float32`). If you only want to look
+at a few products, or read small pieces of many without keeping copies, reading the archive
+products in place with the NISAR GDAL plugin may suit you better (see *Slim products or the NISAR
+GDAL plugin?*).
+
+The default selection of bands is tuned for the GrIMP ice-velocity workflow and is listed by
+`--help` and in *Choosing bands and precision*. Within GrIMP it replaces the whole-product
+`aria2c` fetch, and the nightly `autoupdateNISAR` uses it for RUNW/ROFF.
 
 ## Telling it what to download
 
-`--urls FILE` is a text file with one granule URL per line, and `--product` says which
-product type those URLs are (one product per run; the descriptor is chosen from it). The URL
-lists normally come straight from `searchASF`, which writes one per product type:
+The input is **just a text file of HTTPS links to NISAR granules, one per line** (`--urls
+FILE`). Nothing else is needed; the granule name is taken from the end of each link and blank
+lines are ignored:
+
+```
+https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GUNW_PROVISIONAL_V1/NISAR_L2_PR_GUNW_023_157_A_143_..._001/NISAR_L2_PR_GUNW_023_157_A_143_..._001.h5
+https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GUNW_PROVISIONAL_V1/...
+```
+
+The list can come from anywhere: `searchASF` (below), ASF's Vertex search (download its URL
+list), `earthaccess` or a CMR query, or written by hand. The links must be the HTTPS ones -- the
+tool reads byte ranges through ASF's HTTPS endpoint with your Earthdata login from `~/.netrc` --
+not `s3://` URIs.
+
+Each run handles **one product type**, named with `--product` (default GCOV), so give it a list
+of that product only. `searchASF` writes one list per product type, which is the easiest way to
+get them:
 
 ```
 searchASF 2026-10-20 2026-10-22 found --products GUNW GOFF --antarctica
@@ -31,24 +87,32 @@ One granule of each product, archive product against the slim file written with 
 (measured 2026-10-30 with this version). Defaults: float32 rasters 10 mantissa bits,
 `unwrappedPhase` 12; float64 geometry cubes 30 of 52 bits, float64 correction cubes 23 of 52;
 float32 metadata cubes kept exactly; every dataset stored compressed (ISCE3 writes the baseline
-cubes uncompressed; they are gzipped losslessly).
+cubes uncompressed; they are gzipped losslessly); GCOV float32 unless `--float16`; paged layout.
 
 | Product | Granule (track_frame, mode) | Archive | Slim | Smaller by | Bands kept | Mantissa bits |
 |---|---|---|---|---|---|---|
-| GCOV | 030_001_A_136, 40+5 MHz | 4572 MB | 862 MB + 540 MB shared factor (first cycle only) | 5.3x (3.3x first cycle) | `HHHH`, `mask`, `rtcGammaToSigmaFactor` (shared file), radarGrid `incidenceAngle`, all metadata | float16 (10 bits, 5-bit exponent) on `HHHH` and the factor |
-| ROFF | 025_100_D_128, 40 MHz | 1065 MB | 229 MB | 4.7x | `slantRangeOffset`, `alongTrackOffset`, `correlationSurfacePeak` (layers 1-3), `mask`, geolocation cubes, all metadata | 10 on the three offset bands; float64 cubes 30 |
-| ROFF | 018_084_D_051, 77 MHz | 495 MB | 121 MB | 4.1x | as above | as above |
-| RUNW | 025_100_D_128, 40 MHz | 375 MB | 101 MB | 3.7x | `unwrappedPhase`, `coherenceMagnitude`, `ionospherePhaseScreen`, `connectedComponents`, `mask`, pixelOffsets (3 bands), geolocation cubes except `coordinateX/Y`, all metadata | 10 on float32 rasters, `unwrappedPhase` 12; float64 cubes 30 |
-| GOFF | 023_157_A_143, 40 MHz | 929 MB | 322 MB | 2.9x | `slantRangeOffset`, `alongTrackOffset`, `correlationSurfacePeak` (layers 1-3), `mask`, radarGrid cubes, all metadata | 10 on the three offset bands; float64 cubes 30 |
-| GUNW | 023_157_A_143, 40 MHz | 1690 MB | 362 MB | 4.7x | unwrappedInterferogram (`unwrappedPhase`, `coherenceMagnitude`, `ionospherePhaseScreen`, `connectedComponents`, `mask`), pixelOffsets (3 bands), radarGrid cubes, all metadata | 10 on float32 rasters, `unwrappedPhase` 12; float64 geometry cubes 30, correction cubes 23 |
+| GCOV | 030_001_A_136, 40+5 MHz | 4572 MB | 1078 MB + 575 MB shared factor (first cycle only) | 4.2x (2.8x first cycle) | `HHHH`, `mask`, `rtcGammaToSigmaFactor` (shared file), radarGrid `incidenceAngle`, all metadata | 10 on `HHHH` and the factor |
+| GCOV `--float16` | as above | 4572 MB | 887 MB + 552 MB shared factor (first cycle only) | 5.2x (3.2x first cycle) | as above | float16 (10 bits, 5-bit exponent, clamped to [1e-4, 65504]) |
+| ROFF | 025_100_D_128, 40 MHz | 1065 MB | 233 MB | 4.6x | `slantRangeOffset`, `alongTrackOffset`, `correlationSurfacePeak` (layers 1-3), `mask`, geolocation cubes, all metadata | 10 on the three offset bands; float64 cubes 30 |
+| ROFF | 018_084_D_051, 77 MHz | 495 MB | 124 MB | 4.0x | as above | as above |
+| RUNW | 025_100_D_128, 40 MHz | 375 MB | 105 MB | 3.6x | `unwrappedPhase`, `coherenceMagnitude`, `ionospherePhaseScreen`, `connectedComponents`, `mask`, pixelOffsets (3 bands), geolocation cubes except `coordinateX/Y`, all metadata | 10 on float32 rasters, `unwrappedPhase` 12; float64 cubes 30 |
+| GOFF | 023_157_A_143, 40 MHz | 929 MB | 329 MB | 2.8x | `slantRangeOffset`, `alongTrackOffset`, `correlationSurfacePeak` (layers 1-3), `mask`, radarGrid cubes, all metadata | 10 on the three offset bands; float64 cubes 30 |
+| GUNW | 023_157_A_143, 40 MHz | 1690 MB | 371 MB | 4.6x | unwrappedInterferogram (`unwrappedPhase`, `coherenceMagnitude`, `ionospherePhaseScreen`, `connectedComponents`, `mask`), pixelOffsets (3 bands), radarGrid cubes, all metadata | 10 on float32 rasters, `unwrappedPhase` 12; float64 geometry cubes 30, correction cubes 23 |
 
 The GCOV factor is written once per track/frame/grid and reused by every later cycle, so the
-steady-state GCOV cost is the 862 MB. "Bands kept" lists the rasters; everything not dropped is
+steady-state GCOV cost is the granule alone (1078 MB, or 887 MB with `--float16`). The paged
+layout adds 2-4% to every file. "Bands kept" lists the rasters; everything not dropped is
 kept (`--help` lists what is dropped). What remains in GOFF/GUNW is mostly the radarGrid cubes
 (20 heights x 817 x 818 on a 40 MHz granule, against 20 x 585 x 164 for ROFF/RUNW): the float32
 cubes, kept exactly, are 125 MB of each once the baselines are gzipped.
 
 ## Rounding errors at default settings
+
+The precision is adjustable: each bit kept halves the error and costs a little more space.
+`--mantissaBits` sets the float32 rasters (10 by default, up to 23), `--phaseBits` the unwrapped
+phase (12), `--geometryBits` and `--correctionBits` the float64 cubes (30 and 23, up to 52), and
+`--float32` turns rounding off altogether. For example, `--mantissaBits 12` gives a quarter of the
+errors below, `--mantissaBits 8` four times them. The table is for the defaults.
 
 Worst case and rms of (rounded - original) over every valid sample, in the band's own units,
 on the same granules (layer 1 shown for ROFF/GOFF; layers 2-3 behave the same). The worst case is
@@ -80,7 +144,8 @@ always |value| x 2^-(bits+1), so it scales with the largest value in the band.
 | GUNW | radarGrid slant range, azimuth time, `groundTrackVelocity` | 30 | as GOFF | as GOFF | as GOFF |
 | GUNW | radarGrid `wet` / `hydrostaticTroposphericPhaseScreen` | 23 | -1.2 to 0.13 / -1.4 to 5.6 rad | 60 nrad / 240 nrad | 5.2 nrad / 65 nrad |
 | GUNW | radarGrid `slantRangeSolidEarthTidesPhase` | 23 | 1.1 to 1.5 rad | 60 nrad | 34 nrad |
-| GCOV | `HHHH` (float16) | 10 | linear power, floored at 1e-4 (-40 dB) | 0.01 dB | -- |
+| GCOV | `HHHH`, `rtcGammaToSigmaFactor` | 10 | linear power | 0.002 dB (relative 4.9e-4) | -- |
+| GCOV `--float16` | `HHHH`, `rtcGammaToSigmaFactor` | float16 | linear power; values below 1e-4 (-40 dB) set to 1e-4, above 65504 to 65504 | 0.002 dB above the floor | -- |
 
 What the rounding does downstream, measured through the GrIMP chain on the 40 MHz Antarctic
 frame (025_100_D_128), slim against full, with a repeatable `lltora`. The RUNW rows were measured
@@ -110,6 +175,9 @@ downloadNISARoptimized --product GUNW --urls found.GUNW --outputDir GUNW
 downloadNISARoptimized --product GOFF --urls found.GOFF --outputDir GOFF
 downloadNISARoptimized --urls gcovUrls.c030 --outputDir GCOV --factorDir GCOV/factors   # GCOV
 
+# GCOV for the GrIMP mosaics: float16, as geomosaic reads (factors already written stay reused)
+downloadNISARoptimized --urls gcovUrls.c030 --outputDir GCOV --factorDir GCOV/factors --float16
+
 # see how much each granule would transfer, without downloading
 downloadNISARoptimized --product GUNW --urls found.GUNW --outputDir GUNW --check
 
@@ -126,6 +194,9 @@ downloadNISARoptimized --product ROFF --urls found.ROFF --outputDir ROFF --addBa
 # GUNW with more precision on phase and on the float64 geometry cubes
 downloadNISARoptimized --product GUNW --urls found.GUNW --outputDir GUNW --phaseBits 14 --geometryBits 36
 
+# only a box (lon/lat) of each GUNW, written as <granule>.subset.h5
+downloadNISARoptimized --product GUNW --urls found.GUNW --outputDir GUNWbox --box 51.0 -69.9 52.2 -69.4
+
 # full precision, unused bands still dropped
 downloadNISARoptimized --product RUNW --urls found.RUNW --outputDir RUNW --float32
 
@@ -133,6 +204,86 @@ downloadNISARoptimized --product RUNW --urls found.RUNW --outputDir RUNW --float
 ls /Volumes/insar4/ian/Data/NISAR/Antarctica40/ROFF/*.h5 > roffPaths
 downloadNISARoptimized --product ROFF --local --urls roffPaths --outputDir ROFFslim
 ```
+
+## Slim products or the NISAR GDAL plugin?
+
+JPL's [NISAR GDAL plugin](https://github.com/ozzp-jpl/nisar-hdf5-gdalplugin)
+(`gdal-driver-nisar`, driver name `NISAR`) is a read-only GDAL driver for NISAR HDF5 products. It
+reads the *archive* products where they are -- locally or straight from S3/HTTP with chunk-aligned
+coalesced range requests -- and exposes every raster to `gdalinfo`, `gdal_translate`, `gdalwarp`,
+QGIS and `rasterio`, with geotransforms for L2/L3, GCPs for L1, validity masks, virtual overviews
+and DEM-based interpolation of the metadata cubes. It is not part of this package: it is a conda
+package pinned to the GDAL minor version it was built for (3.12.x, with HDF5 2.x), which is a
+requirement we do not want to place on our code. The two tools answer different questions, and
+can be combined.
+
+| Use the plugin when | Use the slim products when |
+|---|---|
+| You want to look at products interactively without keeping copies (QGIS, a tile server) | You keep a local archive and want it 3-5x smaller |
+| You want a different window each time, read straight from S3/HTTP | You come back to the same data: fetch it once, then read it locally -- whole frames, or with `--box` just your area of each GCOV/GOFF/GUNW |
+| You need part of a radar-geometry product (RUNW, ROFF): `--box` covers only the geocoded GCOV/GOFF/GUNW (for RSLC, see `downloadRSLCSubset`) | You need whole RUNW/ROFF frames, or areas of geocoded products |
+| You work in GDAL tools and can use a dedicated conda env with GDAL 3.12 | You need any HDF5 reader -- h5py, `nisarhdf`, GDAL's own `HDF5` driver, C -- on whatever GDAL/HDF5 you have |
+| You want L1 GCPs, cube interpolation with a DEM, or derived bands (amplitude/phase) | You want to choose, per product, which bands to keep and at what precision |
+
+**Do slim files work with the plugin? Yes**, with the exceptions in the table. Tested 2026-10-30
+with the plugin installed on petermann (GDAL 3.10.3 / HDF5 1.14.3, older than the plugin's README
+asks for):
+
+| Slim file | Reads through the plugin? |
+|---|---|
+| GCOV (default, float32) | **Yes**, georeferenced |
+| GCOV with `--float16` | **No** on GDAL 3.10 (`Unsupported HDF5 data type`); GDAL 3.11+ has a float16 type, so it may read with the plugin's GDAL 3.12 -- untested. Use the default float32 if you need the plugin. |
+| GOFF, GUNW | **Yes**, georeferenced |
+| GCOV, GOFF, GUNW subsets (`--box`) | **Yes**, georeferenced |
+| ROFF | **Yes**, the data read (radar geometry) |
+| RUNW | **Data yes, georeferencing no**: the plugin builds RUNW's georeferencing from the `coordinateX/Y` cubes, which slim RUNWs drop. Add `--addBands coordinateX coordinateY` to keep them. (On this GDAL the plugin also reported an error georeferencing the *archive* RUNW, so this may need its GDAL 3.12 anyway.) |
+
+Things to know:
+
+- **Slim files made before 2026-10-30 do not open** (`H5Fopen failed ... Ensure metadata fits in
+  8MiB`). The plugin needs the paged HDF5 layout the archive products use, which the tool has
+  written since then. `h5repack -S PAGE -P 1 -G 2097152 old.h5 new.h5` converts an old one.
+- **The polarization lists match what a slim file holds.** The tool rewrites
+  `listOfCovarianceTerms` (GCOV) and `listOfPolarizations` to the term or polarization it kept,
+  so the plugin's `POL` check and `nisarhdf` see only bands that exist. (Slim files made before
+  2026-10-30 still list every term of a dual-pol granule.)
+- **Installing the plugin changes how GDAL opens any NISAR `.h5`**, slim or not: it takes them
+  over from GDAL's own `HDF5` driver. Code that relies on the `HDF5` driver (and its flattened
+  attribute names) must now ask for it explicitly -- prefix the path with `HDF5:`, or open with
+  `allowed_drivers=["HDF5"]`. geomosaic had to do this (see its documentation).
+
+## Box subsets (`--box`, GCOV/GOFF/GUNW)
+
+`--box LONMIN LATMIN LONMAX LATMAX` (WGS84 degrees) fetches and keeps only the part of each
+granule covering the box, written as `<granule>.subset.h5`; granules the box misses are
+skipped. It combines with everything else (band choices, rounding, `--local`, `--check`).
+
+- Each grid in the product -- the image grids, `metadata/radarGrid`, GCOV's coarse calibration
+  grids -- is cropped by its own window, computed from its own coordinate axes and EPSG, so
+  grids of different spacing stay consistent. `xCoordinates`/`yCoordinates` are cropped with
+  them.
+- Image-grid windows are widened to whole chunks (512 x 512), so the subset keeps the archive's
+  chunk alignment; the metadata grids get one cell of margin. The subset is therefore somewhat
+  larger than the box, more so in polar stereographic where a lon/lat box is a wedge.
+- `identification/boundingPolygon` is replaced by the subset's footprint; root attributes
+  `subsetOf`, `subsetBox` and `subsetWindows` record where it came from.
+- GCOV's RTC factor is cropped and kept inside the subset (a cropped factor cannot be shared
+  across cycles), so `factorFrom:` / `factorFrom=` is not needed for subsets.
+
+Measured, one box of 1.2 deg x 0.5 deg (51.0-52.2 E, 69.9-69.4 S) on the 40 MHz GUNW/GOFF pair,
+and 3 deg x 0.5 deg on the GCOV, against the full-frame slim files at the same defaults:
+
+| Product | Subset | Full-frame slim | Fetched |
+|---|---|---|---|
+| GUNW | 23 MB (1024 x 1536 px) | 371 MB | 0.45 GB of 1.69 GB |
+| GOFF | 36 MB (1024 x 1536 px) | 329 MB | -- (`--local`) |
+| GCOV | 101 MB (6656 x 5120 px) | 1078 MB | -- (`--local`) |
+
+Every dataset in the subsets is identical to the same window of the full-frame slim file, and
+both `nisarhdf` and the NISAR GDAL plugin open them, georeferenced. The transfer is dominated by
+the metadata cubes: the archive chunks them 512 x 512 on a grid of about 820 x 820, so any box
+touches roughly 40% of each cube at every height -- about 300 MB on a GUNW however small the box.
+Dropping cubes you do not need (`--dropBands wetTroposphericPhaseScreen ...`) is what reduces it.
 
 ## Choosing bands and precision
 
@@ -145,10 +296,16 @@ downloadNISARoptimized --product ROFF --local --urls roffPaths --outputDir ROFFs
                      phase cubes [23]
 --dropBands A B ...  also drop datasets or groups with these names, wherever they are
 --addBands A B ...   keep names the product defaults drop
---float32            no rounding at all (and no float16 for GCOV)
+--float16            GCOV only: HHHH and the RTC factor as float16 (what the GrIMP
+                     mosaics use); default float32 rounded to --mantissaBits
+--float32            no rounding at all
 ```
 
-GCOV uses float16 regardless of these. The float32 metadata cubes (incidence and elevation
+GCOV follows `--mantissaBits` unless `--float16` is given. float16 halves the band again but
+clamps values to [1e-4, 65504] (-40 to +48 dB), needs a GDAL with a float16 type (3.11+) to read
+through GDAL, and is not read by the NISAR GDAL plugin on GDAL 3.10. A shared factor's file
+name records its precision (`_m10`, `_f32`; float16 keeps the untagged name), so granules of
+different precision never share one. The float32 metadata cubes (incidence and elevation
 angle, line-of-sight and along-track unit vectors, baselines) are never rounded.
 
 Names match any path component, so a group name drops the whole group
@@ -166,7 +323,7 @@ Default bands (also printed by `--help`):
 
 | Product | Drops | Rounds |
 |---|---|---|
-| GCOV | `numberOfLooks`, `inputDataExceptionMask`, the squinted radarGrid cubes except `incidenceAngle` | `HHHH` and `rtcGammaToSigmaFactor` to float16 (factor shared) |
+| GCOV | `numberOfLooks`, `inputDataExceptionMask`, the squinted radarGrid cubes except `incidenceAngle` | `HHHH` and `rtcGammaToSigmaFactor` (factor shared), float16 with `--float16` |
 | ROFF | the three variances, `snr`, `digitalElevationModel` | `slantRangeOffset`, `alongTrackOffset`, `correlationSurfacePeak`; float64 geometry cubes |
 | GOFF | the three variances, `snr` | `slantRangeOffset`, `alongTrackOffset`, `correlationSurfacePeak`; float64 geometry cubes |
 | RUNW | both `digitalElevationModel`s, `ionospherePhaseScreenUncertainty`, `coordinateX/Y` cubes | every float32 raster; float64 geometry cubes |
@@ -182,13 +339,14 @@ A GCOV is ~3 GB with ~280 datasets; `geomosaic` reads five, and
 2. Fetches only those ranges, coalesced into large runs over parallel HTTP range
    requests, into a sparse scratch file (see [Scratch space](#scratch-space)).
 3. Repacks into a slim HDF5 with the **same internal paths**, so `geomosaic` and
-   `nisarhdf` read it unchanged. The two big float bands become float16 (values
-   outside the float16 range are clamped, and the count is recorded).
+   `nisarhdf` read it unchanged. The two big float bands are rounded to
+   `--mantissaBits` (float32), or with `--float16` become float16 (values outside
+   [1e-4, 65504] are clamped, and the counts are recorded).
 4. Stores `rtcGammaToSigmaFactor` once per track/direction/frame/mode/grid in
    `--factorDir`, and leaves a symlink there named like the granule; later cycles
    of the same position reuse it instead of fetching it again.
-5. Verifies the slim file (required datasets present, no float16
-   underflow/inf inside the valid mask, factor grid matches) and appends a line
+5. Verifies the slim file (required datasets present; for float16, no
+   underflow/inf inside the valid mask; factor grid matches) and appends a line
    to `<outputDir>/slimManifest.jsonl`.
 
 Repack of one granule overlaps the fetch of the next (`--repackWorkers`
@@ -270,23 +428,22 @@ serves every term. To keep two terms today, run once per term into separate `--o
 both runs name the output after the granule, and a run skips any granule whose output already
 exists.
 
-Two consequences of keeping one term, not yet handled:
+Readers see a consistent file:
 
-- `listOfCovarianceTerms` is copied unchanged, so a slim dual-pol granule still lists the
-  terms it no longer holds. `geomosaic` is unaffected -- it reads only the term its yaml names
-  (`HH` -> `HHHH`) -- but anything that trusts the list will look for the missing ones.
-- `nisarhdf.nisarGCOVHDF` loads, by default, every listed term plus `numberOfLooks` and
-  `rtcGammaToSigmaFactor`, none of which a slim GCOV holds in the granule itself; opening a slim
-  GCOV with default fields is therefore expected to fail (not tested -- only single-pol slim
-  GCOVs exist so far, and `geomosaic` is the consumer). Passing `fields=['HHHH', 'mask']`
-  avoids it.
+- `listOfCovarianceTerms` and `listOfPolarizations` are rewritten to the kept term (and the
+  polarizations it uses, `HVHV` -> `HV`), so readers that trust the lists see only what is there.
+  Slim GCOVs made before 2026-10-30 still list every term.
+- `nisarhdf.nisarGCOVHDF` loads, by default, the listed terms, `mask`, and `numberOfLooks` and
+  `rtcGammaToSigmaFactor` when the granule holds them. For sigma0 from a slim GCOV whose factor
+  is shared, pass the factor directory: `openHDF(file, sigma0=True, factorFrom=<--factorDir>)`
+  (a `--box` subset carries its own factor, so it is not needed there).
 
 ## Local conversion (`--local`)
 
 With `--local`, `--urls` lists **local** granule paths, which are converted with
 the same repack as the fetch path (no network). Originals are never modified or
 removed, and the run refuses to start if `--outputDir` is where they live.
-Granules already slim (GCOV in float16; others carrying `grimpSlim`, or for ROFF/RUNW made
+Granules already slim (carrying `grimpSlim`; GCOVs made before it, in float16; ROFF/RUNW made
 before that attribute, missing `snr` / `ionospherePhaseScreenUncertainty`) are skipped.
 
 ## CLI
@@ -308,6 +465,9 @@ downloadNISARoptimized --urls FILE [options]
   --correctionBits N   Bits (of 52) kept on float64 troposphere/solid-earth-tide cubes [23]
   --dropBands A B ...  Also drop datasets/groups with these names
   --addBands A B ...   Keep names the product defaults drop
+  --box LON0 LAT0 LON1 LAT1
+                       GCOV/GOFF/GUNW: keep only this lon/lat box (<granule>.subset.h5)
+  --float16            GCOV only: float16 HHHH and factor (GrIMP mosaics)
   --float32            Keep the float bands at full precision
   --noShareFactor      Store the RTC factor in each granule instead of sharing it
   --connections N      Parallel range requests per granule [16]
