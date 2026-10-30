@@ -89,19 +89,52 @@ F16MINNORMAL = 6.104e-5
 # 0.138% of pixels, at reduced precision) stops being used at all.
 F16FLOOR = 1.0e-4
 
-# Per-product descriptor. GCOV, ROFF and RUNW are implemented; the shape is here so RSLC can
-# be added without touching the fetch/repack machinery.
+# Per-product descriptor. GCOV, ROFF, RUNW, GOFF and GUNW are implemented; the shape is here
+# so RSLC can be added without touching the fetch/repack machinery.
 #   dropGrids  - dataset basenames under the grid never transferred
+#   dropGroups - group names directly under the grid never transferred (with all they hold)
 #   dropCubes  - dataset basenames under radarGrid never transferred
+#                (--addBands removes names from these three; --dropBands adds names matched
+#                anywhere in the product)
 #   lossy      - how the big kept rasters are reduced: 'float16' or 'mantissa'
 #   shared     - dataset stored once per (track, frame, grid) and referenced by every cycle,
 #                or None
 #   polPath    - where the polarization's data sits under the grid
-#   mantissaBits, mantissaBitsFor - bits kept by 'mantissa' (default, per dataset basename)
-#   lossyGroups - if given, every float32 raster/cube under these is rounded (RUNW);
-#                otherwise only mantissaLayers under polPath (ROFF)
-#   slimMarker - dataset whose absence marks a granule already slim (--local skips it)
-#   required   - datasets verifySlim insists on
+#   polGroups  - groups under the grid holding one subgroup per polarization; the others' are
+#                dropped
+#   phaseBands - rounded to --phaseBits rather than --mantissaBits (unwrapped phase, whose
+#                error scales with |phase|)
+#   lossyGroups - if given, every float32 raster under these is rounded (RUNW, GUNW);
+#                otherwise only mantissaLayers under polPath (ROFF, GOFF). The float32
+#                metadata cubes are never rounded.
+#   cubes64    - True: the float64 cubes in GEOMETRY_CUBES / CORRECTION_CUBES are rounded to
+#                --geometryBits / --correctionBits of their 52 mantissa bits
+#   (any kept chunked float dataset stored uncompressed -- ISCE3 writes the baseline cubes
+#   that way -- is gzipped losslessly on repack, whether or not it is rounded)
+#   slimMarker - dataset whose absence marks a granule slimmed before the grimpSlim root
+#                attribute existed (--local skips it)
+#   required   - datasets verifySlim insists on (less any the caller drops with --dropBands)
+# Rounding defaults (Ian, 2026-10-30), each settable on the command line. A float keeps its
+# exponent, so the worst-case error is |value| * 2^-(bits+1).
+#   --mantissaBits   float32 rasters, 10 of 23 bits (relative error <= 4.9e-4)
+#   --phaseBits      unwrappedPhase, mantissaBits + 2: ~430 rad on a 40 MHz frame is 0.031 rad
+#                    max at 12 bits against 0.12 rad at 10
+#   --geometryBits   float64 GEOMETRY_CUBES, 30 of 52 bits: slant range (0.83-1.21e6 m) 0.5 mm,
+#                    zero-Doppler azimuth time (~1.1e4 s) 3.8 us -- 30 us near 86400 s (~2.5 cm /
+#                    ~20 cm along track) -- groundTrackVelocity 2e-6 m/s. float32 precision
+#                    (23 bits) would be 0.5 ms / 6 cm, so these need more.
+#   --correctionBits float64 CORRECTION_CUBES, 23 of 52 bits: phase screens of a few radians,
+#                    <= 2.4e-7 rad
+# The float32 metadata cubes are never rounded.
+DEFAULT_MANTISSA_BITS = 10
+PHASE_EXTRA_BITS = 2
+GEOMETRY_CUBES = ('referenceZeroDopplerAzimuthTime', 'secondaryZeroDopplerAzimuthTime',
+                  'referenceSlantRange', 'secondarySlantRange', 'groundTrackVelocity')
+DEFAULT_GEOMETRY_BITS = 30
+CORRECTION_CUBES = ('wetTroposphericPhaseScreen', 'hydrostaticTroposphericPhaseScreen',
+                    'slantRangeSolidEarthTidesPhase')
+DEFAULT_CORRECTION_BITS = 23
+
 PRODUCTS = {
     'GCOV': {
         'product': 'GCOV',
@@ -150,10 +183,13 @@ PRODUCTS = {
         # Kept layers stay float32 with the same filters, rounded to 10 mantissa bits (relative
         # error <= 4.9e-4) so gzip+shuffle packs them ~2x tighter and every reader is unchanged.
         # Measured on a 40 MHz Antarctic frame, the final range/azimuth offsets differ from the
-        # full product by 1e-3 px RMS, less than ROFFtoGrimp's own run-to-run scatter.
+        # full product by 1e-3 px RMS, less than ROFFtoGrimp's own run-to-run scatter. The
+        # geolocationGrid cubes are not rounded; the two baselines, stored uncompressed by
+        # ISCE3, are gzipped losslessly.
         'lossy': 'mantissa',
-        'mantissaBits': 10,
         'mantissaLayers': ('slantRangeOffset', 'alongTrackOffset', 'correlationSurfacePeak'),
+        'cubes64': True,
+        'polGroups': ('pixelOffsets',),
         'shared': None,
         'slimMarker': '{pol}/layer1/snr',
         'required': [f'{{pol}}/layer{n}/{f}' for n in (1, 2, 3)
@@ -178,14 +214,16 @@ PRODUCTS = {
         # groundTrackVelocity (carrierCorrection) are read and kept.
         'radarGrid': '/science/LSAR/RUNW/metadata/geolocationGrid',
         'dropCubes': ('coordinateX', 'coordinateY'),
-        # Every float32 raster and cube is rounded (uncompressed ones are gzipped as well, which
-        # takes the two baseline cubes from 57 MB to 2.5 MB). unwrappedPhase gets 12 bits: its
-        # error scales with |phase|, ~430 rad on a 40 MHz Antarctic frame, where 10 bits is
+        # Every float32 raster is rounded; the float32 cubes are not (the baselines, stored
+        # uncompressed, are gzipped losslessly) and float64 cubes go to --geometryBits.
+        # unwrappedPhase gets 2 more bits:
+        # its error scales with |phase|, ~430 rad on a 40 MHz Antarctic frame, where 10 bits is
         # 0.12 rad max (0.07 m/yr on a 12-day pair) and 12 bits 0.031 rad, for +3 MB.
         'lossy': 'mantissa',
-        'mantissaBits': 10,
-        'mantissaBitsFor': {'unwrappedPhase': 12},
-        'lossyGroups': ('{grid}/', '{root}/metadata/geolocationGrid/'),
+        'phaseBands': ('unwrappedPhase',),
+        'lossyGroups': ('{grid}/',),
+        'cubes64': True,
+        'polGroups': ('interferogram', 'pixelOffsets'),
         'shared': None,
         'slimMarker': '{pol}/ionospherePhaseScreenUncertainty',
         'required': ['{pol}/unwrappedPhase', '{pol}/coherenceMagnitude',
@@ -197,15 +235,99 @@ PRODUCTS = {
                      '{root}/metadata/geolocationGrid/groundTrackVelocity',
                      '/science/LSAR/identification/boundingPolygon'],
     },
+    'GOFF': {
+        # Geocoded ROFF: same layers and the same choice (ROFFtoGrimp's three bands kept and
+        # rounded, the variances and snr dropped; there is no DEM). The radarGrid cubes are not
+        # rounded; the two baselines (168 MB on a 40 MHz granule, stored uncompressed by ISCE3)
+        # are gzipped losslessly.
+        'product': 'GOFF',
+        'polarization': 'HH',
+        'polPath': '{grid}/pixelOffsets/{pol}',
+        'root': '/science/LSAR/GOFF',
+        'grid': '/science/LSAR/GOFF/grids/frequency{f}',
+        'dropGrids': ('alongTrackOffsetVariance', 'slantRangeOffsetVariance',
+                      'crossOffsetVariance', 'snr'),
+        'lossy': 'mantissa',
+        'mantissaLayers': ('slantRangeOffset', 'alongTrackOffset', 'correlationSurfacePeak'),
+        'cubes64': True,
+        'polGroups': ('pixelOffsets',),
+        'shared': None,
+        'required': [f'{{pol}}/layer{n}/{f}' for n in (1, 2, 3)
+                     for f in ('slantRangeOffset', 'alongTrackOffset', 'correlationSurfacePeak')]
+                    + ['{grid}/pixelOffsets/xCoordinates', '{grid}/pixelOffsets/projection',
+                       '{grid}/pixelOffsets/mask', '{root}/metadata/radarGrid/incidenceAngle',
+                       '/science/LSAR/identification/boundingPolygon'],
+    },
+    'GUNW': {
+        # Geocoded RUNW, with the same choice: unwrappedInterferogram (whose coherence
+        # globalMosaic reads) and pixelOffsets kept, ionospherePhaseScreenUncertainty dropped,
+        # every float32 raster rounded (unwrappedPhase to --phaseBits), float64 radarGrid cubes
+        # to --geometryBits / --correctionBits, float32 cubes kept exactly (the uncompressed
+        # baselines gzipped). On top of that the whole wrappedInterferogram group is dropped --
+        # complex64 interferogram, its own 80 m coherence and mask, about half of a
+        # 1.7 GB 40 MHz granule. --addBands wrappedInterferogram keeps it (the complex64
+        # interferogram is then copied exactly, not rounded).
+        'product': 'GUNW',
+        'polarization': 'HH',
+        'polPath': '{grid}/unwrappedInterferogram/{pol}',
+        'root': '/science/LSAR/GUNW',
+        'grid': '/science/LSAR/GUNW/grids/frequency{f}',
+        'dropGrids': ('ionospherePhaseScreenUncertainty',),
+        'dropGroups': ('wrappedInterferogram',),
+        'lossy': 'mantissa',
+        'phaseBands': ('unwrappedPhase',),
+        'lossyGroups': ('{grid}/',),
+        'cubes64': True,
+        'polGroups': ('unwrappedInterferogram', 'wrappedInterferogram', 'pixelOffsets'),
+        'shared': None,
+        'required': ['{pol}/unwrappedPhase', '{pol}/coherenceMagnitude',
+                     '{pol}/ionospherePhaseScreen', '{pol}/connectedComponents',
+                     '{grid}/unwrappedInterferogram/mask',
+                     '{grid}/unwrappedInterferogram/xCoordinates',
+                     '{grid}/unwrappedInterferogram/projection',
+                     '{grid}/pixelOffsets/{p}/alongTrackOffset',
+                     '{root}/metadata/radarGrid/incidenceAngle',
+                     '/science/LSAR/identification/boundingPolygon'],
+    },
 }
+
+
+def defaultBandsHelp():
+    '''Per-product defaults for the --help epilog, built from PRODUCTS so it cannot drift.'''
+    lines = ['default bands (--dropBands adds to the dropped lists, --addBands takes names out',
+             f'of them). Rounding: --mantissaBits {DEFAULT_MANTISSA_BITS}, --phaseBits mantissaBits + '
+             f'{PHASE_EXTRA_BITS}, --geometryBits {DEFAULT_GEOMETRY_BITS}, '
+             f'--correctionBits {DEFAULT_CORRECTION_BITS} by default.', '']
+    for name, desc in PRODUCTS.items():
+        lines.append(f'  {name}')
+        for key, label in (('dropGroups', 'drops groups'), ('dropGrids', 'drops'),
+                           ('dropCubes', 'drops cubes')):
+            if desc.get(key):
+                lines.append(f'    {label + ":":13s} {" ".join(desc[key])}')
+        if desc['lossy'] == 'float16':
+            lines.append(f'    {"reduces:":13s} {desc["polarization"]} and {desc["shared"]} to '
+                         f'float16 ({desc["shared"]} stored once per track/frame/grid)')
+        elif 'lossyGroups' in desc:
+            phase = ' '.join(desc.get('phaseBands', ()))
+            lines.append(f'    {"rounds:":13s} every float32 raster to --mantissaBits'
+                         + (f' ({phase}: --phaseBits)' if phase else ''))
+        else:
+            lines.append(f'    {"rounds:":13s} {" ".join(desc["mantissaLayers"])} to --mantissaBits')
+        if desc.get('cubes64'):
+            lines.append(f'    {"float64 cubes:":13s} {" ".join(GEOMETRY_CUBES)} to --geometryBits; '
+                         f'{" ".join(CORRECTION_CUBES)} to --correctionBits (if present)')
+        lines.append(f'    {"keeps:":13s} everything else exactly (gzipped if stored uncompressed)')
+    return '\n'.join(lines)
 
 
 def downloadNISARoptimizedArgs():
     '''Handle command line args'''
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description='\n\n\033[1mFetch NISAR products keeping only the datasets the GrIMP '
-                    'tools read, as float16, with a shared RTC factor.\033[0m\n\n',
-        epilog='Part of the asfSearchAndDownload package.')
+                    'tools read: GCOV as float16 with a shared RTC factor, ROFF/RUNW/GOFF/GUNW '
+                    'as mantissa-rounded float32.\033[0m\n\n',
+        epilog=defaultBandsHelp() + '\n\nPart of the asfSearchAndDownload package.')
     parser.add_argument('--urls', type=str, required=True,
                         help='file with one granule URL per line')
     parser.add_argument('--outputDir', type=str, default='.',
@@ -215,12 +337,30 @@ def downloadNISARoptimizedArgs():
     parser.add_argument('--product', type=str, default='GCOV',
                         choices=sorted(PRODUCTS), help='NISAR product type [GCOV]')
     parser.add_argument('--polarization', type=str, default=None,
-                        help='covariance term (GCOV) or polarization (ROFF/RUNW) to keep '
-                             '[HHHH for GCOV, HH for ROFF/RUNW]')
+                        help='covariance term (GCOV) or polarization (ROFF/RUNW/GOFF/GUNW) to '
+                             'keep [HHHH for GCOV, HH otherwise]')
     parser.add_argument('--frequency', type=str, default='A', help='A or B [A]')
+    parser.add_argument('--mantissaBits', type=int, default=DEFAULT_MANTISSA_BITS,
+                        help='mantissa bits (of 23) kept on ROFF/RUNW/GOFF/GUNW float32 rasters '
+                             f'(GCOV uses float16) [{DEFAULT_MANTISSA_BITS}]')
+    parser.add_argument('--phaseBits', type=int, default=None,
+                        help='mantissa bits (of 23) kept on unwrappedPhase (RUNW/GUNW) '
+                             f'[mantissaBits + {PHASE_EXTRA_BITS}]')
+    parser.add_argument('--geometryBits', type=int, default=DEFAULT_GEOMETRY_BITS,
+                        help='mantissa bits (of 52) kept on the float64 slant-range, '
+                             f'azimuth-time and groundTrackVelocity cubes [{DEFAULT_GEOMETRY_BITS}]')
+    parser.add_argument('--correctionBits', type=int, default=DEFAULT_CORRECTION_BITS,
+                        help='mantissa bits (of 52) kept on the float64 tropospheric and '
+                             f'solid-earth-tide phase cubes [{DEFAULT_CORRECTION_BITS}]')
+    parser.add_argument('--dropBands', type=str, nargs='+', default=[],
+                        help='also drop datasets or groups with these names, wherever they '
+                             'are in the product (e.g. snr wetTroposphericPhaseScreen)')
+    parser.add_argument('--addBands', type=str, nargs='+', default=[],
+                        help='keep these even though the product defaults drop them (e.g. '
+                             'wrappedInterferogram for GUNW, snr for ROFF)')
     parser.add_argument('--float32', action='store_true',
-                        help='keep the float bands at full precision (default float16 for '
-                             'GCOV, 10-bit mantissa for ROFF/RUNW, 12 for RUNW unwrappedPhase)')
+                        help='keep the float bands at full precision (no float16 for GCOV, '
+                             'no mantissa rounding otherwise)')
     parser.add_argument('--noShareFactor', action='store_true',
                         help='store the RTC factor in each granule instead of sharing it')
     parser.add_argument('--connections', type=int, default=16,
@@ -240,7 +380,36 @@ def downloadNISARoptimizedArgs():
                         help='treat --urls as LOCAL granule paths and convert them in place of '
                              'downloading. Originals are never touched, so --outputDir must '
                              'differ from where they live.')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.phaseBits is None:
+        args.phaseBits = min(23, args.mantissaBits + PHASE_EXTRA_BITS)
+    for name, top in (('mantissaBits', 23), ('phaseBits', 23), ('geometryBits', 52),
+                      ('correctionBits', 52)):
+        if not 1 <= getattr(args, name) <= top:
+            parser.error(f'--{name} must be 1..{top}')
+    return args
+
+
+def roundingBits(args):
+    '''The four rounding choices, as repack and the manifest record them.'''
+    return dict(mantissa=args.mantissaBits, phase=args.phaseBits,
+                geometry=args.geometryBits, correction=args.correctionBits)
+
+
+def applyBandOverrides(desc, dropBands, addBands):
+    '''A copy of desc with --addBands taken out of its default drop lists and --dropBands
+    recorded, for wanted() and verifySlimRequired().'''
+    desc = dict(desc)
+    add = set(addBands)
+    defaults = set()
+    for key in ('dropGrids', 'dropGroups', 'dropCubes'):
+        defaults |= set(desc.get(key, ()))
+        desc[key] = tuple(x for x in desc.get(key, ()) if x not in add)
+    for name in sorted(add - defaults):
+        print(f'  note: --addBands {name} is not dropped by default for {desc["product"]}; '
+              'nothing to add back', flush=True)
+    desc['userDrop'] = frozenset(dropBands)
+    return desc
 
 
 def granuleStem(url):
@@ -310,7 +479,11 @@ def wanted(path, desc, grid, otherGrid, polarization, frequency):
     if path.startswith(otherGrid):
         return False
     base = os.path.basename(path)
+    if desc.get('userDrop') and desc['userDrop'] & set(path.split('/')):
+        return False
     if path.startswith(grid) and base in desc['dropGrids']:
+        return False
+    if any(path.startswith(f'{grid}/{g}/') for g in desc.get('dropGroups', ())):
         return False
     if 'radarGrid' in desc and path.startswith(desc['radarGrid']) \
             and base in desc['dropCubes']:
@@ -319,10 +492,9 @@ def wanted(path, desc, grid, otherGrid, polarization, frequency):
     if path.startswith(grid) and len(base) == 4 and base != polarization \
             and all(c in 'HV' for c in base):
         return False
-    # ROFF/RUNW: whole pixelOffsets/<pol> and interferogram/<pol> groups for the other
-    # polarizations
-    if desc['product'] in ('ROFF', 'RUNW'):
-        for sub in ('pixelOffsets', 'interferogram'):
+    # whole <polGroup>/<pol> groups for the other polarizations
+    if 'polGroups' in desc:
+        for sub in desc['polGroups']:
             if path.startswith(f'{grid}/{sub}/'):
                 p = path[len(f'{grid}/{sub}/'):].split('/')[0]
                 if len(p) == 2 and p != polarization and all(c in 'HV' for c in p):
@@ -332,6 +504,9 @@ def wanted(path, desc, grid, otherGrid, polarization, frequency):
 
 def isLossy(path, obj, desc, grid, polarization):
     '''True for the big rasters that are reduced (float16 or mantissa-rounded) on repack.'''
+    if obj.dtype == np.float64 and desc.get('cubes64') and \
+            os.path.basename(path) in GEOMETRY_CUBES + CORRECTION_CUBES:
+        return True
     if 'lossyGroups' in desc:
         groups = [g.format(grid=grid, root=desc['root']) for g in desc['lossyGroups']]
         return (obj.dtype == np.float32 and obj.ndim >= 2
@@ -343,12 +518,16 @@ def isLossy(path, obj, desc, grid, polarization):
 
 
 def roundMantissa(x, keep):
-    '''Round float32 to `keep` mantissa bits, to nearest (ties away); NaN/inf untouched.'''
-    bits = x.view(np.uint32)
-    drop = 23 - keep
-    mask = np.uint32((0xFFFFFFFF >> drop) << drop)
-    r = (bits + np.uint32(1 << (drop - 1))) & mask
-    return np.where(np.isfinite(x), r, bits).astype(np.uint32).view(np.float32)
+    '''Round float32 (23-bit mantissa) or float64 (52-bit) to `keep` mantissa bits, to nearest
+    (ties away), keeping the exponent; NaN/inf untouched.'''
+    uint, full = (np.uint64, 52) if x.dtype == np.float64 else (np.uint32, 23)
+    if keep >= full:
+        return x
+    bits = x.view(uint)
+    drop = full - keep
+    mask = uint((int(np.iinfo(uint).max) >> drop) << drop)
+    r = (bits + uint(1 << (drop - 1))) & mask
+    return np.where(np.isfinite(x), r, bits).astype(uint).view(x.dtype)
 
 
 def keptDatasets(h, desc, polarization, frequency, shareFactor):
@@ -474,7 +653,7 @@ def copyDataset(src, dst, path, toFloat16, step=4096, mantissaBits=None):
     Raw chunk copy when the values are unchanged, so nothing is decompressed and the result is
     bit-identical to the archive.
     '''
-    if mantissaBits is not None and src.dtype == np.float32:
+    if mantissaBits is not None and src.dtype in (np.float32, np.float64):
         # Same dtype, chunks and filters as the source, so readers see no difference; only the
         # dropped low bits change, which is what lets gzip compress it. A source stored
         # uncompressed (the RUNW/ROFF baseline cubes) gets gzip+shuffle, or rounding buys nothing.
@@ -520,6 +699,13 @@ def copyDataset(src, dst, path, toFloat16, step=4096, mantissaBits=None):
             d[y:y + step] = block.astype('f2')
         d.attrs['grimpClampedToF16Max'] = nClamped
         d.attrs['grimpFlooredToF16Floor'] = nFloored
+    elif src.chunks is not None and src.compression is None and src.dtype.kind in 'fiu':
+        # Stored uncompressed (ISCE3 writes the baseline cubes that way): gzip it losslessly.
+        d = dst.create_dataset(path, shape=src.shape, dtype=src.dtype, chunks=src.chunks,
+                               compression='gzip', compression_opts=1, shuffle=True,
+                               fillvalue=src.fillvalue)
+        for y in range(0, src.shape[0], step):
+            d[y:y + step] = src[y:y + step]
     elif src.chunks is not None:
         d = dst.create_dataset(path, shape=src.shape, dtype=src.dtype, chunks=src.chunks,
                                compression=src.compression,
@@ -583,8 +769,9 @@ def reattachScalesFromSource(src, dst):
         print(f'  warning: could not reattach dimension scales ({e})', flush=True)
 
 
-def repack(job, desc, polarization, frequency, toFloat16):
-    '''Build the slim granule (and the shared factor, if it is not already there).'''
+def repack(job, desc, polarization, frequency, toFloat16, bits):
+    '''Build the slim granule (and the shared factor, if it is not already there). bits is
+    roundingBits(args): mantissa, phase, geometry and correction bits.'''
     grid = desc['grid'].format(f=frequency)
     sharedPath = f'{grid}/{desc["shared"]}'
     outPath, tmp = job['outPath'], job['outPath'] + '.partial'
@@ -594,10 +781,15 @@ def repack(job, desc, polarization, frequency, toFloat16):
             for path, big in job['chunked']:
                 if path == sharedPath and job['shareFactor']:
                     continue            # lives in the shared file, not in the granule
-                bits = desc.get('mantissaBitsFor', {}).get(os.path.basename(path),
-                                                           desc.get('mantissaBits'))
+                base = os.path.basename(path)
+                if s[path].dtype == np.float64:
+                    keep = bits['correction'] if base in CORRECTION_CUBES else bits['geometry']
+                elif base in desc.get('phaseBands', ()):
+                    keep = bits['phase']
+                else:
+                    keep = bits['mantissa']
                 copyDataset(s[path], d, path, toFloat16 and big and not mantissa,
-                            mantissaBits=bits if toFloat16 and big and mantissa else None)
+                            mantissaBits=keep if toFloat16 and big and mantissa else None)
             for path, (data, attrs, dtype) in job['small'].items():
                 ds = d.create_dataset(path, data=data, dtype=dtype)
                 for k, v in attrs.items():
@@ -610,6 +802,12 @@ def repack(job, desc, polarization, frequency, toFloat16):
                 reattachScales(d, grid, polarization)
             else:
                 reattachScalesFromSource(s, d)
+                # What was done to it, and the mark --local uses to skip a slim granule
+                d.attrs['grimpSlim'] = json.dumps(dict(
+                    product=desc['product'], polarization=polarization,
+                    bits=None if not toFloat16 else bits,
+                    dropped=sorted(set(desc.get('dropGrids', ())) | set(desc.get('dropGroups', ()))
+                                   | set(desc.get('dropCubes', ())) | desc.get('userDrop', set()))))
         if job['factorPath'] is not None and not os.path.exists(job['factorPath']):
             ftmp = job['factorPath'] + '.partial'
             with h5py.File(ftmp, 'w') as fd:
@@ -627,6 +825,7 @@ def verifySlimRequired(outPath, desc, polarization, frequency):
     with h5py.File(outPath, 'r') as h:
         needs = [n.format(grid=grid, pol=pol, p=polarization, root=desc['root'])
                  for n in desc['required']]
+        needs = [n for n in needs if not desc.get('userDrop', set()) & set(n.split('/'))]
         return [f'missing {n}' for n in needs if n not in h]
 
 
@@ -893,7 +1092,8 @@ def convertOne(path, args, desc, claimed):
         if desc['product'] == 'GCOV' and h[pol].dtype == np.float16:
             print(f'  skipping {stem[-34:]}: already float16', flush=True)
             return None
-        if 'slimMarker' in desc and desc['slimMarker'].format(pol=pol) not in h:
+        if 'grimpSlim' in h.attrs or \
+                ('slimMarker' in desc and desc['slimMarker'].format(pol=pol) not in h):
             print(f'  skipping {stem[-34:]}: already slim', flush=True)
             return None
         shareFactor = not args.noShareFactor and desc['shared'] is not None
@@ -925,7 +1125,8 @@ def convertOne(path, args, desc, claimed):
 def repackOne(job, args, desc):
     '''Repack, verify, and leave the per-granule factor symlink. Runs in a worker process.'''
     try:
-        repack(job, desc, args.polarization, args.frequency, not args.float32)
+        repack(job, desc, args.polarization, args.frequency, not args.float32,
+               roundingBits(args))
         if job['linkPath'] is not None:
             if os.path.lexists(job['linkPath']):
                 os.remove(job['linkPath'])
@@ -956,7 +1157,7 @@ def repackOne(job, args, desc):
 
 def main():
     args = downloadNISARoptimizedArgs()
-    desc = PRODUCTS[args.product]
+    desc = applyBandOverrides(PRODUCTS[args.product], args.dropBands, args.addBands)
     if args.polarization is None:
         args.polarization = desc['polarization']
     if args.factorDir is None:
@@ -978,7 +1179,8 @@ def main():
         urls = urls[:args.maxGranules]
     lossy = ('float32' if args.float32 else
              'float16' if desc['lossy'] == 'float16' else
-             '{}-bit mantissa'.format(desc['mantissaBits']))
+             'mantissa bits {mantissa}, phase {phase}, geometry {geometry}, correction '
+             '{correction}'.format(**roundingBits(args)))
     print('{} {} granules, output {}, {}{}'.format(
         len(urls), args.product, args.outputDir,
         f'factors {args.factorDir}, ' if desc['shared'] is not None else '', lossy), flush=True)

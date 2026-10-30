@@ -13,7 +13,7 @@ Search the ASF DAAC for NISAR / Sentinel-1 products, dedupe against a local arch
 | `refreshS1Orbits` | `refreshOrbits.py:main()` | Refresh the precise-orbit (EOF) archive from ASF `aux_poeorb` |
 | `fileS1` | `fileS1.py:main()` | Unpack S1 SAFE zips into the `assemblyDir` `track-<n>/<orbit>/` tree |
 | `checkFramesS1` | `checkFramesS1.py:main()` | Vet filed datatakes (burst "frames"), restructure, and queue → toProcess/pending/problem |
-| `downloadNISARoptimized` | `downloadNISARoptimized.py:main()` | Fetch NISAR products keeping only the datasets the GrIMP tools read: GCOV as float16 with a shared RTC factor, ROFF/RUNW without unused bands, with 10-bit-mantissa (RUNW phase 12-bit) float32 layers |
+| `downloadNISARoptimized` | `downloadNISARoptimized.py:main()` | Fetch NISAR products keeping only the datasets the GrIMP tools read: GCOV as float16 with a shared RTC factor; ROFF/RUNW/GOFF/GUNW without unused bands (GUNW also without `wrappedInterferogram`), float32 rasters rounded to `--mantissaBits` (10; `--phaseBits` 12), float64 cubes to `--geometryBits` 30 / `--correctionBits` 23, float32 cubes exact, everything compressed. `--dropBands`/`--addBands` override the defaults, which `--help` lists |
 | `downloadRSLCSubset` | `downloadRSLCSubset.py:main()` | Fetch a spatial subset of a NISAR RSLC as a slim RSLC with cropped, self-consistent geometry |
 | `logNetworkUse` | `networkLog.py:main()` | Log a finished `aria2c -i` session (shell scripts) to `~/networkLogs/networkLog.<host>` |
 | `networkMonitor` | `networkLog.py:monitorMain()` | Cron (every minute): internet-interface (default-route) traffic to `~/networkLogs/interfaceLog.<host>` |
@@ -174,6 +174,12 @@ A region-wide search area clips in frames just outside an individual track's `fr
 `checkExcludeFrames --assemblyDir ... --gpkgDir ...` validates: per listed frame, `CLASH` if that track's real units use it (exit 1), otherwise how many binned SAFEs it accounts for. Frame numbers are resolvable only from the retained search gpkgs, so granules older than all of them are reported unmatched, never assumed safe. See `Documents/excludeFrames.md`; track-141 frame 378 is deliberately excluded from the list (in range on some datatakes, not others).
 
 ## downloadNISARoptimized
+
+Also handles ROFF, RUNW, GOFF and GUNW (`--product`), as mantissa-rounded float32 with the
+unused bands dropped; `--mantissaBits`/`--phaseBits`/`--geometryBits`/`--correctionBits`, `--dropBands` and `--addBands` override the
+per-product defaults in `PRODUCTS`, and `--help` prints them. What to fetch is a URL list per
+product, normally `searchASF`'s `<output>.<PRODUCT>` file. Full detail, measurements and the
+GOFF/GUNW notes are in `Documents/downloadNISARoptimized.md`; the GCOV-specific notes follow.
 
 Replaces the whole-product `aria2c` fetch for NISAR GCOV (and the ad-hoc
 `Antarctica-GCOV/gcovDownload.sh`). A GCOV is ~3 GB with ~280 datasets; `geomosaic` reads five,
