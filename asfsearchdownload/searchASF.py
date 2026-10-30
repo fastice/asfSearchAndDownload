@@ -15,6 +15,10 @@ import sys
 import threading
 import urllib.request
 
+import shapely.wkt
+from shapely.geometry import Polygon
+from shapely.geometry.polygon import orient
+
 
 # ---------------------------------------------------------------------------
 # Sensor-specific defaults and allowed values
@@ -98,17 +102,18 @@ def _wkt_to_cmr_spatial_params(wkt, max_vertices=200):
     range (-180 to 180) and extends to the pole, so searches like AllAntarctica
     capture the full orbital swath rather than a partial sector.
     """
-    inner = wkt.replace('POLYGON((', '').rstrip(')')
-    pairs = []
-    for pair_str in inner.split(','):
-        parts = pair_str.strip().split()
-        if len(parts) == 2:
-            try:
-                pairs.append((float(parts[0]), float(parts[1])))
-            except ValueError:
-                pass
-    if not pairs:
+    # Parsed with shapely, not by hand: a shapefile's OGR WKT ('POLYGON ((', MULTIPOLYGON, or
+    # 'POLYGON Z') defeated the old string split -- the first vertex was lost, parts were run
+    # together, or nothing parsed and the search went out with no spatial filter at all.
+    # Mirror what asf_search does for the public search: drop Z, convex-hull a multi-part
+    # shape, and orient counter-clockwise, which CMR requires (a clockwise ring is a 400).
+    shape = shapely.wkt.loads(wkt)
+    if shape.is_empty:
         return {}
+    if shape.geom_type != 'Polygon':
+        shape = shape.convex_hull
+    shape = orient(Polygon(shape.exterior), sign=1.0)
+    pairs = [(float(x), float(y)) for x, y, *_ in shape.exterior.coords]
 
     lons = [p[0] for p in pairs]
     lats = [p[1] for p in pairs]
@@ -1070,7 +1075,8 @@ Part of the asfSearchAndDownload package.
              '  *.geojson / *.json  — GeoJSON polygon\n'
              '  *.shp               — ESRI shapefile (reprojected to WGS84)\n'
              '  other               — flat lon,lat coordinate file (GrIMP style)\n'
-             'Default: bundled Greenland.lonlat',
+             'With no --searchArea, --greenland or --antarctica, Greenland '
+             '(the bundled Greenland.lonlat outline) is searched.',
     )
     parser.add_argument(
         '--greenland', action='store_true', default=False,
@@ -1085,23 +1091,17 @@ Part of the asfSearchAndDownload package.
 
     # --- archive deduplication ---
     parser.add_argument(
-        '--archiveDir', default=None, metavar='GLOB',
-        help='Glob pattern for already-downloaded files, e.g. \'/data/NISAR/*\' '
-             '(quote wildcards to prevent shell expansion). '
-             'A directory hit (e.g. a bare \'.\') is expanded exactly one '
-             'level to the files directly inside it -- NOT recursive, and '
-             'any subdirectories found at that level are skipped, not '
-             'descended into. If your archive is laid out in per-product '
-             'subdirectories (e.g. ./RUNW/*.h5, ./ROFF/*.h5), pass a glob '
-             'that reaches those files directly, e.g. \'./*/*\' -- a plain '
-             '\'.\' will NOT see into them. Brace patterns like '
-             '\'./{RUNW,ROFF}/*\' are NOT supported: this is passed straight '
-             'to Python glob, which does not expand braces, and quoting stops '
-             'the shell from expanding them either -- use \'./*/*\'. '
+        '--archiveDir', default=None, metavar='PATTERN',
+        help='Where the already-downloaded files are: a path with wildcards (* matches any '
+             'characters, ? one character), e.g. \'/data/NISAR/*/*\'. Put it in quotes so '
+             'the shell passes the wildcards through. A pattern that matches a directory '
+             'covers only the files directly inside it, not its subdirectories: for an '
+             'archive with one folder per product (./RUNW/*.h5, ./ROFF/*.h5) use \'./*/*\', '
+             'since \'.\' alone would not look into them. Lists in braces '
+             '(\'./{RUNW,ROFF}/*\') are not supported; use \'./*/*\'. '
              'Extensions .h5 / .zip / .zip.1 are stripped before comparison. '
              'Matching products are skipped; for NISAR, if a newer processor '
-             'version exists the URL is written to <archived_file>.updated '
-             'beside the archive file.',
+             'version exists its URL is written to <output>.updated.',
     )
 
     # --- GeoPackage export ---
