@@ -34,11 +34,12 @@ import asyncio
 import glob
 import hashlib
 import json
+import multiprocessing
 import os
 import socket
 import sys
 import time
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 
 import aiohttp
 import fsspec
@@ -389,11 +390,21 @@ def downloadNISARoptimizedArgs():
                         help='stop after this many, 0 for all [0]')
     parser.add_argument('--check', action='store_true',
                         help='report what would be fetched and exit')
+    parser.add_argument('--inPlace', action='store_true',
+                        help='with --local: replace each original by its slim version, after '
+                             'the slim file has been written beside it and verified; the path, '
+                             'permissions and modification time are kept. Originals are not '
+                             'recoverable except by downloading them again. --outputDir then '
+                             'holds only the manifest')
     parser.add_argument('--local', action='store_true',
                         help='treat --urls as LOCAL granule paths and convert them in place of '
                              'downloading. Originals are never touched, so --outputDir must '
                              'differ from where they live.')
     args = parser.parse_args()
+    if args.inPlace and not args.local:
+        parser.error('--inPlace needs --local')
+    if args.inPlace and args.box is not None:
+        parser.error('--inPlace cannot be combined with --box (a subset is not a replacement)')
     if args.box is not None:
         if args.product not in BOX_PRODUCTS:
             parser.error(f'--box applies to {"/".join(BOX_PRODUCTS)} only')
@@ -1223,8 +1234,12 @@ def chooseTmpDir(args):
         return tmpDir
 
 
-def fetchOne(url, args, desc, session, claimed):
-    '''Resolve, plan and fetch one granule into a sparse scratch file.
+def planOne(url, args, desc, session, claimed):
+    '''Resolve and plan one granule: which byte ranges to fetch. No bulk transfer.
+
+    Planning reads the HDF5 index over HTTP, a few dozen small requests at ~2 s latency each
+    (8-10 s per granule), so main() runs it for the next granule while the current one
+    downloads. Returns None for a granule to skip.
 
     `claimed` holds factor paths already being written by a repack still in flight. Without
     it the existence check races the pipeline: two granules of the same position back to
@@ -1288,6 +1303,20 @@ def fetchOne(url, args, desc, session, claimed):
         ' (factor reused)' if shareFactor and not needFactor else ''), flush=True)
     if args.check:
         return None
+    return dict(stem=stem, outPath=outPath, signed=signed, runs=runs, size=size,
+                job=dict(stem=stem, outPath=outPath,
+                         factorPath=factorPath if needFactor else None,
+                         linkPath=(os.path.join(args.factorDir, stem + '.h5')
+                                   if shareFactor else None),
+                         factorTarget=os.path.basename(factorPath) if shareFactor else None,
+                         chunked=chunked, small=small, groups=groups,
+                         gridKey=key, gridSig=sig, shareFactor=shareFactor,
+                         windows=windows, box=args.box))
+
+
+def fetchPlanned(plan, args):
+    '''Fetch a planned granule's byte ranges into a sparse scratch file; return its job.'''
+    stem, size, signed, runs = plan['stem'], plan['size'], plan['signed'], plan['runs']
     sparse = scratchPath(args.tmpDir, stem)
     if os.path.exists(sparse):
         os.remove(sparse)
@@ -1309,14 +1338,7 @@ def fetchOne(url, args, desc, session, claimed):
                 connections=args.connections)
     print('    fetched {:.2f} GB in {:.0f} s ({:.1f} MB/s)'.format(
         got / 1e9, time.time() - t0, got / (time.time() - t0) / 1e6), flush=True)
-    return dict(stem=stem, sparse=sparse, outPath=outPath,
-                factorPath=factorPath if needFactor else None,
-                linkPath=(os.path.join(args.factorDir, stem + '.h5')
-                          if shareFactor else None),
-                factorTarget=os.path.basename(factorPath) if shareFactor else None,
-                chunked=chunked, small=small, groups=groups,
-                gridKey=key, gridSig=sig, shareFactor=shareFactor,
-                windows=windows, box=args.box)
+    return dict(plan['job'], sparse=sparse)
 
 
 def convertOne(path, args, desc, claimed):
@@ -1330,9 +1352,18 @@ def convertOne(path, args, desc, claimed):
     stem = granuleStem(path)
     if trackFrameKey(stem) is None:
         return None
-    outPath = os.path.join(args.outputDir, stem + ('.subset.h5' if args.box else '.h5'))
-    if os.path.exists(outPath):
-        return None
+    if args.inPlace:
+        # Written beside the original (same filesystem, so the final rename is atomic) under a
+        # hidden name, which the archive's wildcard listings do not match. A leftover from an
+        # interrupted run is discarded; the original is only ever replaced once verified.
+        outPath = os.path.join(os.path.dirname(path), f'.{stem}.slim.h5')
+        for stale in (outPath, outPath + '.partial'):
+            if os.path.exists(stale):
+                os.remove(stale)
+    else:
+        outPath = os.path.join(args.outputDir, stem + ('.subset.h5' if args.box else '.h5'))
+        if os.path.exists(outPath):
+            return None
     grid = desc['grid'].format(f=args.frequency)
     with h5py.File(path, 'r') as h:
         pol = desc['polPath'].format(grid=grid, pol=args.polarization)
@@ -1378,7 +1409,8 @@ def convertOne(path, args, desc, claimed):
                 factorTarget=os.path.basename(factorPath) if shareFactor else None,
                 chunked=chunked, small=small, groups=groups,
                 gridKey=key, gridSig=sig, shareFactor=shareFactor, keepSource=True,
-                windows=windows, box=args.box)
+                windows=windows, box=args.box,
+                replaceTarget=path if args.inPlace else None)
 
 
 def repackOne(job, args, desc):
@@ -1398,6 +1430,19 @@ def repackOne(job, args, desc):
         with h5py.File(job['outPath'], 'r') as h:
             p = '{}/{}'.format(desc['grid'].format(f=args.frequency), args.polarization)
             clamped = int(h[p].attrs.get('grimpClampedToF16Max', 0)) if p in h else 0
+        target = job.get('replaceTarget')
+        if target is not None:
+            if problems:
+                # failed verification: the original stays exactly as it was
+                os.remove(job['outPath'])
+                return job['stem'], 0, problems + ['original kept'], clamped
+            # FileNISARProducts breaks ties between duplicate RUNWs on modification time, so
+            # the replacement must not look newer than the file it replaces.
+            st = os.stat(target)
+            os.chmod(job['outPath'], st.st_mode & 0o7777)
+            os.replace(job['outPath'], target)
+            os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return job['stem'], os.path.getsize(target), problems, clamped
         return job['stem'], os.path.getsize(job['outPath']), problems, clamped
     except Exception as e:
         # Never let one granule kill the run: a repack that fails here leaves no output, so
@@ -1429,7 +1474,7 @@ def main():
     if not args.local:
         args.tmpDir = chooseTmpDir(args)
     urls = [u.strip() for u in open(args.urls) if u.strip()]
-    if args.local:
+    if args.local and not args.inPlace:
         bad = [u for u in urls
                if os.path.realpath(os.path.dirname(u)) == os.path.realpath(args.outputDir)]
         if bad:
@@ -1451,12 +1496,29 @@ def main():
     nDone, nFail, t0 = 0, 0, time.time()
     # Repack of granule N overlaps the fetch of N+1: the fetch is bandwidth bound and the
     # repack is single-threaded CPU, so with a couple of workers the CPU disappears.
-    with ProcessPoolExecutor(args.repackWorkers) as pool:
+    # Planning of granule N+1 also overlaps the fetch of N, in one background thread, so its
+    # ~2 s-latency index reads cost nothing; the downloads themselves stay one at a time.
+    # Workers are spawned, not forked: a fork taken while the planner thread is inside HDF5
+    # copies its held lock into the child, and that repack then waits on it for ever.
+    with ProcessPoolExecutor(args.repackWorkers,
+                             mp_context=multiprocessing.get_context('spawn')) as pool, \
+            ThreadPoolExecutor(1) as planner:
         pending, claimed = [], set()
-        for url in urls:
+        nextPlan = (planner.submit(planOne, urls[0], args, desc, session, claimed)
+                    if urls and not args.local else None)
+        for i, url in enumerate(urls):
             try:
-                job = (convertOne(url, args, desc, claimed) if args.local
-                       else fetchOne(url, args, desc, session, claimed))
+                if args.local:
+                    job = convertOne(url, args, desc, claimed)
+                else:
+                    # queue the next plan before waiting on this one: the single planner
+                    # thread keeps them in order, and a failed plan cannot stall the next
+                    current, nextPlan = nextPlan, None
+                    if i + 1 < len(urls):
+                        nextPlan = planner.submit(planOne, urls[i + 1], args, desc, session,
+                                                  claimed)
+                    plan = current.result()
+                    job = fetchPlanned(plan, args) if plan is not None else None
             except Exception as e:
                 print(f'  FAILED {granuleStem(url)}: {e}', flush=True)
                 nFail += 1

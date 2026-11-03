@@ -349,9 +349,7 @@ A GCOV is ~3 GB with ~280 datasets; `geomosaic` reads five, and
    underflow/inf inside the valid mask; factor grid matches) and appends a line
    to `<outputDir>/slimManifest.jsonl`.
 
-Repack of one granule overlaps the fetch of the next (`--repackWorkers`
-processes). Granules whose output already exists are skipped, so a rerun
-resumes.
+Downloads run one at a time. While a granule downloads, the next one is planned (its HDF5 index read, ~10 s of small requests) and the previous ones are repacked (`--repackWorkers` processes), so in a batch the downloads run back to back: four 40 MHz GUNWs took 104 s against 127 s for `aria2c -x 10` fetching the whole files, while moving half the data.
 
 Measured on one Antarctic granule (3.06 GB / 172 s for the archive product):
 
@@ -446,6 +444,27 @@ removed, and the run refuses to start if `--outputDir` is where they live.
 Granules already slim (carrying `grimpSlim`; GCOVs made before it, in float16; ROFF/RUNW made
 before that attribute, missing `snr` / `ionospherePhaseScreenUncertainty`) are skipped.
 
+## Converting an archive in place (`--inPlace`)
+
+`--local --inPlace` replaces each archive granule by its slim version, keeping its path, so
+anything that links to the archive (track/orbit directories, VRTs naming the file) keeps working:
+
+```
+ls /data/NISAR/Antarctica40/ROFF/*.h5 > roffPaths
+downloadNISARoptimized --product ROFF --local --inPlace --urls roffPaths --outputDir ./slimLog
+```
+
+For each granule the slim file is written beside the original under a hidden name
+(`.<granule>.slim.h5`, which wildcard listings of the archive do not match), verified, and only
+then renamed over the original in one atomic step; the original's permissions and modification
+time are put back on the new file (duplicate RUNWs are ranked by modification time). If the
+conversion or the verification fails, the original is left exactly as it was. Granules already
+slim are skipped, so a run can be stopped and restarted, or repeated over a mixed archive.
+`--outputDir` then holds only `slimManifest.jsonl`.
+
+**The originals cannot be recovered afterwards** except by downloading them again. Run it while
+nothing else reads or writes the archive (pause any nightly download first).
+
 ## CLI
 
 ```
@@ -478,6 +497,7 @@ downloadNISARoptimized --urls FILE [options]
   --maxGranules N      Stop after this many, 0 for all [0]
   --check              Report what would be fetched and exit
   --local              Convert local granules instead of downloading
+  --inPlace            With --local: replace each original by its verified slim version
 ```
 
 See *Examples* above.
