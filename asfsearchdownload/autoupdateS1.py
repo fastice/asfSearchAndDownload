@@ -10,7 +10,9 @@ for other regions/periods). Each run:
      existing archive,
   3. downloads new passes one at a time via ariaDownload, verifies each zip,
      re-downloading on failure, and strips the unneeded cross-pol in a parallel
-     thread (reduceSentinel1) while the next download starts.
+     thread (reduceSentinel1) while the next download starts. With
+     remoteReduce: true the cross-pol is never downloaded instead
+     (remoteReduceS1, HTTP range requests, optional maxRate MB/s cap).
 
 New passes are filed under archiveDir/<YYYY>-<MM>/ where the month comes from
 the first date token in the granule name. A pass already present as .zip or
@@ -48,6 +50,8 @@ from asfsearchdownload import refreshOrbits
 from asfsearchdownload import fileS1
 from asfsearchdownload import checkFramesS1
 from asfsearchdownload import queueS1
+from asfsearchdownload import remoteReduceS1
+from asfsearchdownload.ariaDownload import getX
 from asfsearchdownload.reduceSentinel1 import remove_files_from_zip
 
 # Per-session logger; handlers are attached by setupLogging() in main().
@@ -1127,6 +1131,37 @@ def downloadOne(url, monthDir, maxAttempts=3, extraArgs=()):
             os.remove(linkFile)
 
 
+def remoteDownloadOne(url, monthDir, pattern, maxAttempts=3, connections=None,
+                      maxRate=0.):
+    '''
+    Fetch a granule already reduced -- the members matching pattern are never
+    downloaded -- into monthDir via remoteReduceS1, retrying up to maxAttempts.
+    Every attempt CRC-checks each kept member before the zip appears under its
+    real name, so there is no separate verify or reduce step. connections
+    defaults to ariaDownload's time-of-day count; maxRate is the combined cap
+    in MB/s over all connections (0 = none). Returns the zip path on success,
+    else None.
+    '''
+    os.makedirs(monthDir, exist_ok=True)
+    name = os.path.basename(url)
+    partPath = os.path.join(monthDir, f'{name}.part')
+    for attempt in range(1, maxAttempts + 1):
+        nConn = getX() if connections is None else connections
+        log.info(f'remoteReduce attempt {attempt}/{maxAttempts}: {name} '
+                 f'({nConn} connections, cap {maxRate or "none"} MB/s)')
+        try:
+            return remoteReduceS1.fetchReduced(
+                url, monthDir, pattern, nConn, maxRate,
+                program='autoupdateS1/remoteReduceS1')
+        except Exception as exc:  # retried; one bad granule must not end the run
+            log.warning(f'{name} remote reduce attempt {attempt} failed: '
+                        f'{exc}')
+        if os.path.exists(partPath):
+            os.remove(partPath)
+    log.error(f'{name} failed after {maxAttempts} attempts')
+    return None
+
+
 def _reduceWorker(zipPath, pattern, pipeline=None):
     '''
     Strip the cross-pol from a downloaded zip (runs in a background thread),
@@ -1630,10 +1665,36 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
     else:
         maxDownloads = int(config.get('maxDownloads', 300))
 
+    # remoteReduce fetches each zip already reduced, so it skips the reduce
+    # thread and goes straight to filing. Opt-in; aria2c + zip -d by default.
+    remote = bool(config.get('remoteReduce', False))
+    maxRate = float(config.get('maxRate', 0) or 0)
+    if remote:
+        log.info(f'download mode: remoteReduce, cap {maxRate or "none"} MB/s')
+        summary.add('download mode', f'remoteReduce, cap {maxRate or "none"} '
+                    'MB/s')
+
+    def fetch(url, monthDir):
+        if remote:
+            return remoteDownloadOne(url, monthDir, reducePattern, maxAttempts,
+                                     getattr(args, 'connections', None),
+                                     maxRate)
+        return downloadOne(url, monthDir, maxAttempts,
+                           extraArgs=ariaExtraArgs(args))
+
+    def reduceAndFile(zipPath):
+        if not remote:
+            startReduce(zipPath, reducePattern, reduceThreads, pipeline)
+            return
+        remoteReduced.append(zipPath)
+        if pipeline is not None:
+            pipeline.submit(zipPath)
+
     # 3. Serial download; parallel cross-pol reduce. The cap is soft: once
     # reached, keep going while the next granule is the same pass (orbit +
     # datatake) as the last one downloaded, so a pass is never left half-fetched.
     reduceThreads = []
+    remoteReduced = []
     nDownloaded = nSkipped = nFailed = nDuplicates = 0
     failedUrls = []
     lastPassKey = None
@@ -1678,8 +1739,7 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
                 nDownloaded += 1
                 lastPassKey = thisPassKey
                 continue
-            zipPath = downloadOne(url, monthDir, maxAttempts,
-                                  extraArgs=ariaExtraArgs(args))
+            zipPath = fetch(url, monthDir)
             if zipPath is None:
                 nFailed += 1
                 failedUrls.append(url)
@@ -1691,7 +1751,7 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
             # can file it, so the unit never holds both copies at once.
             if action == DUP_REPLACE:
                 retireDuplicate(archiveDir, held, heldUnit)
-            startReduce(zipPath, reducePattern, reduceThreads, pipeline)
+            reduceAndFile(zipPath)
 
         # 3b. Retry the failures once at the end of the run. Exhausting all
         # attempts in a few seconds usually means a brief ASF-side outage rather
@@ -1705,8 +1765,7 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
             for url in failedUrls:
                 name = os.path.basename(url)
                 monthDir = monthDirFor(archiveDir, name)
-                zipPath = downloadOne(url, monthDir, maxAttempts,
-                                      extraArgs=ariaExtraArgs(args))
+                zipPath = fetch(url, monthDir)
                 if zipPath is None:
                     log.error(f'still failing after retry pass: {name}')
                     stillFailing.append(url)
@@ -1715,7 +1774,7 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
                 nDownloaded += 1
                 nRecovered += 1
                 log.info(f'downloaded on retry: {name} -> {monthDir}')
-                startReduce(zipPath, reducePattern, reduceThreads, pipeline)
+                reduceAndFile(zipPath)
             log.info(f'retry pass: recovered {nRecovered} of '
                      f'{len(failedUrls)}')
             summary.add('retry pass',
@@ -1733,7 +1792,8 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
     verb = 'would download' if args.check else 'downloaded'
     filedNote = '' if pipeline is None else f', filed {pipeline.nFiled}'
     log.info(f'summary: {verb} {nDownloaded}, skipped {nSkipped}, '
-             f'failed {nFailed}; {len(reduceThreads)} reduced{filedNote}')
+             f'failed {nFailed}; '
+             f'{len(reduceThreads) + len(remoteReduced)} reduced{filedNote}')
     summary.add(verb, nDownloaded)
     summary.add('already in archive', nSkipped)
     summary.add('duplicate products skipped', nDuplicates)

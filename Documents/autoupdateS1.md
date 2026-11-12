@@ -33,6 +33,14 @@ and `autoupdate.yaml` will grow to carry their config.
    already inside the cap), and recoveries are folded back into the summary
    counts, so `failed N` reports only what is still missing after the retry.
 
+   **`remoteReduce: true`** (opt-in, added 2026-11-12) replaces aria2c + reduce
+   with [`remoteReduceS1`](remoteReduceS1.md): each zip is fetched already
+   reduced with HTTP range requests (the cross-pol is never downloaded, so
+   about half the traffic) and CRC-checked before it gets its real name, then
+   goes straight to filing, with no reduce thread. Retries, the retry pass and the
+   cap work as above. The connection count still follows ariaDownload's time
+   of day (or `--connections`), and `maxRate` caps the combined rate in MB/s.
+
    **Concurrent filing.** Once a granule's reduce returns, it is handed straight
    to a small pool of filing workers (`fileWorkers`, default 2) that unzip it
    into the assembly tree while the *next* granule downloads. Unzipping (~88 s)
@@ -158,6 +166,8 @@ direction:  both           # both | ascending | descending [both]
 # maxDownloads: 300        # soft cap per run (0 = no limit); finishes the pass [300]
 # reducePattern: hv        # cross-pol substring to strip (Greenland HH+HV) [hv]
 # maxAttempts: 3           # download retries per pass [3]
+# remoteReduce: false      # fetch zips already reduced (remoteReduceS1) [off]
+# maxRate: 0               # remoteReduce combined cap, MB/s (0 = none) [0]
 # fileWorkers: 2           # concurrent unzips while downloading [2]
 #                          #   (to turn it off use --noFileDuringDownload)
 # assemble: true           # run stage 6 (setupTrack) after the frame check [off]
