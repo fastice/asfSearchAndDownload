@@ -39,7 +39,27 @@ out-of-range remainder is trimmed later by `trimTopsSLCsToFit`).
 
 Directory-suffix convention: `_1, _2, …` are far-side gap segments (and also
 `fileS1`'s datatake-filing suffix — they can coincide), `_4` is the over-length
-split head.
+split head, `_5, _6, …` are late-SAFE units (below).
+
+### Late SAFEs (filed after the orbit was processed)
+
+ASF's search can omit granules for weeks even though they are in CMR — track-170/4061
+(S1D 2026-08-10) had 6 of its 12 slices first returned on 09-16 and 09-28, all in
+CMR since 08-11; S1C was hit the same way (track-83/8931). `fileS1` unpacks such
+stragglers into the bare `<orbit>` dir, which is already processed, so before
+2026-11 nothing ever assembled them (a 2026-11-11 sweep found 50 such SAFEs in 16
+orbits).
+
+For a processed bare orbit, every SAFE in `<orbit>/` that its `inputSAFE` does not
+name — and that is not a republished copy (same name up to the 4-character product
+id) of one it does — is segmented by gaps into new units `<orbit>_5`, `_6`, … and
+routed like any other unit (queue comment `late SAFEs: …`). Suffixes start at 5 and
+skip any existing `<orbit>_N` or `<orbit>-N`. The processed products are never
+touched; the late segments become extra pieces of the datatake. Out-of-range late
+SAFEs go to `tmp/`. A processed orbit without an `inputSAFE` (assembled before the
+file existed) is left alone. Unprocessed `_5+` units are re-routed on every run, so
+one whose queue write was lost is not stranded. `--noLateUnits` restores the old
+behaviour (report `-> processed`, do nothing).
 
 ## Queues
 
@@ -103,7 +123,7 @@ that the `Failed` marker produces here.
 A unit carrying an `Ignore` file is **skipped** (not queued). A unit already
 **fully processed** (a `Completed` marker or its `{orbit}-{seq}` output dir exists,
 per `setupTrack`) is reported `-> processed` for info and left untouched — never
-restructured or queued. The queues are **idempotent**: a unit already present in
+restructured or queued (SAFEs filed into it since are handled as late-SAFE units, above). The queues are **idempotent**: a unit already present in
 *any* queue is reported `already queued` and never re-added; each file is rewritten
 as a unit-deduped, sorted list.
 
@@ -133,6 +153,7 @@ checkFramesS1 [track] [options]
   --noSplit            Do not split over-length (>127 burst) datatakes
   --noBreakGap         Do not break gapped datatakes into segments
   --noMoveOutOfRange   Do not move out-of-range SAFEs to tmp/
+  --noLateUnits        Leave SAFEs filed into an already-processed orbit alone
 ```
 
 Standalone examples:

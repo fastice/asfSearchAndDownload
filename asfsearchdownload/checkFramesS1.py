@@ -36,6 +36,8 @@ MAX_FRAMES = 127              # processor limit; > 127 in-range bursts must spli
 DEFAULT_FRAME_RANGE = [300, 750]
 GAP_SUFFIX_START = 1         # far-side gap segments -> <orbit>_1, _2, _3, ...
 SPLIT_SUFFIX = 4             # long-split head       -> <orbit>_4
+LATE_SUFFIX_START = 5        # SAFEs filed after the orbit was processed
+                             #                       -> <orbit>_5, _6, ...
 QUEUES = queueS1.QUEUES
 QUEUE_LABEL = {'toProcess': 'toProcess', 'pendingProcessing': 'pending',
                'problem': 'problem'}
@@ -294,12 +296,81 @@ def analyzeOrbit(trackDir, orbit, frameRange, opts):
     return units, moves, toTmp, residual, diag
 
 
+def readInputSafe(unitPath):
+    ''' SAFE basenames a processed unit was assembled from (its inputSAFE), or
+    None if it has no inputSAFE (assembled before the file existed). '''
+    try:
+        with open(os.path.join(unitPath, 'inputSAFE')) as fp:
+            return {line.strip() for line in fp if line.strip()}
+    except OSError:
+        return None
+
+
+def analyzeLateSafes(trackDir, orbit, frameRange, opts):
+    ''' Plan units for SAFEs filed into an orbit after it was processed.
+
+    ASF's search can leave granules out for weeks (track-170/4061, S1D
+    2026-08-10: 6 of 12 slices first returned 09-16/09-28 although in CMR
+    since 08-11), and fileS1 then unpacks the stragglers into the already
+    processed bare dir, where nothing would ever assemble them. Here each
+    SAFE in the bare dir that its inputSAFE does not name -- and that is not
+    a republished copy of one it does -- is segmented by gaps into new units
+    <orbit>_5, _6, ... (suffixes never reuse an existing _N or -N). The
+    processed products are left untouched; the late segments become extra
+    pieces of the datatake.
+
+    Also returns unprocessed late units left by an earlier run (moved, but the
+    queue write failed), so they are routed rather than stranded.
+    Returns (units, moves, toTmp) as analyzeOrbit does. '''
+    barePath = os.path.join(trackDir, str(orbit))
+    units, moves, toTmp = {}, [], []
+    used = readInputSafe(barePath)
+    if used is not None:
+        usedScenes = {name[:-len('_XXXX.SAFE')] for name in used}
+        ascNodeTime = getAscNodeTime(barePath, opts['check'])
+        late = [r for r in getOrbitSafe(barePath, ascNodeTime)
+                if os.path.basename(r[6]) not in used and
+                os.path.basename(r[6])[:-len('_XXXX.SAFE')] not in usedScenes]
+        late.sort(key=lambda r: r[2])
+        oor = outOfRange(late, frameRange)
+        if not opts['noMoveOutOfRange']:
+            toTmp = [late[i][6] for i in sorted(oor)]
+        inRange = [r for i, r in enumerate(late) if i not in oor]
+        if inRange:
+            taken = {int(re.split('[_-]', e)[-1]) for e in os.listdir(trackDir)
+                     if re.fullmatch(rf'{orbit}[_-]\d+', e)}
+            suffix = LATE_SUFFIX_START
+            for seg in splitByGaps(inRange, checkGaps(inRange)):
+                while suffix in taken:
+                    suffix += 1
+                uname = f'{orbit}_{suffix}'
+                units[uname] = list(seg)
+                moves += [(r[6], uname) for r in seg]
+                taken.add(suffix)
+    for other in sorted(glob.glob(os.path.join(trackDir, f'{orbit}_*'))):
+        base = os.path.basename(other)
+        if (isSourceOrbitDir(base) and base not in units
+                and parseOrbitSeq(base)[1] >= LATE_SUFFIX_START
+                and not isProcessed(trackDir, base)):
+            try:
+                units[base] = getOrbitSafe(other,
+                                           getAscNodeTime(other, opts['check']))
+            except Exception:
+                units[base] = []
+    return units, moves, toTmp
+
+
 def residualForDir(unitPath, frameRange, check=False):
     ''' Recompute the unresolved-issue reason for an already-existing unit dir. '''
     try:
         info = getOrbitSafe(unitPath, getAscNodeTime(unitPath, check))
     except Exception as exc:
         return f'error: {exc}'
+    return residualForRows(info, frameRange)
+
+
+def residualForRows(info, frameRange):
+    ''' The unresolved-issue reason for a unit's SAFE rows (sorted by name). '''
     if not info:
         return None
     if checkGaps(info):
@@ -522,7 +593,8 @@ def trackNumber(trackDir):
 
 def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
                 lastDate=None, queueDir=None, check=False, noSplit=False,
-                noBreakGap=False, noMoveOutOfRange=False, excludeTracks=None):
+                noBreakGap=False, noMoveOutOfRange=False, excludeTracks=None,
+                noLateUnits=False):
     ''' Vet in-range datatakes under assemblyDir, restructure each into clean
     processing units, and route each into the cumulative toProcess /
     pendingProcessing / problem queues. Returns the new entries per queue.
@@ -557,7 +629,7 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
     if lastDate is None:
         lastDate = datetime.now() + timedelta(days=1)
     opts = {'check': check, 'noSplit': noSplit, 'noBreakGap': noBreakGap,
-            'noMoveOutOfRange': noMoveOutOfRange}
+            'noMoveOutOfRange': noMoveOutOfRange, 'noLateUnits': noLateUnits}
 
     queues = queueS1.readQueues(queueDir)
     newEntries = {name: [] for name in QUEUES}
@@ -606,7 +678,8 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
                 dayStr = f'  {round((asc - priorAsc).total_seconds() / 86400):+d}d'
             priorAsc = asc
             barePath = os.path.join(trackDir, str(orbit))
-            # already-processed datatakes are shown for info and left untouched
+            # already-processed datatakes are left untouched; only SAFEs filed
+            # into them since become new units
             if isProcessed(trackDir, str(orbit)):
                 info = getOrbitSafe(barePath, asc)
                 inRange = [r for i, r in enumerate(info)
@@ -614,6 +687,37 @@ def checkFrames(assemblyDir='.', track=None, orbitDir=None, firstDate=None,
                 print(headerLine(trackName, orbit, f'{info[0][2]:%Y-%m-%d}',
                                  dayStr, info, frameStr(inRange, frameRange),
                                  'processed', frameRange))
+                if opts['noLateUnits']:
+                    continue
+                try:
+                    units, moves, toTmp = analyzeLateSafes(
+                        trackDir, orbit, frameRange, opts)
+                except Exception as exc:
+                    print(f'    late SAFE analysis error ({exc})')
+                    continue
+                if not check:
+                    executeMoves(trackDir, moves, toTmp)
+                for unitName in sorted(units):
+                    rows = units[unitName]
+                    rel = f'{trackName}/{unitName}'
+                    if rel in seen:
+                        tag = 'already queued'
+                    else:
+                        queue, reason = routeUnit(
+                            trackDir, unitName, rows,
+                            residualForRows(rows, frameRange), orbitDir)
+                        tag = f'{QUEUE_LABEL.get(queue, "skip")} ({reason})'
+                        if queue:
+                            queueUnit(queues, newEntries, deltas, queue,
+                                      unitRecord(trackName, unitName, rows,
+                                                 frameRange),
+                                      f'late SAFEs: {reason}')
+                            seen.add(rel)
+                    print(f'    {unitName}: late SAFEs, frames '
+                          f'{frameStr(rows, frameRange)} -> {tag}')
+                if toTmp:
+                    print(f'    {len(toTmp)} late SAFE out of range '
+                          f'[{frameRange[0]},{frameRange[1]}]')
                 continue
             try:
                 units, moves, toTmp, residual, diag = analyzeOrbit(
@@ -747,6 +851,10 @@ def parseArgs():
                         help='Do not break datatakes with gaps into segments')
     parser.add_argument('--noMoveOutOfRange', action='store_true',
                         help='Do not move out-of-range SAFEs to tmp/')
+    parser.add_argument('--noLateUnits', action='store_true',
+                        help='Leave SAFEs filed into an already-processed '
+                        'orbit alone, instead of assembling them as new '
+                        '<orbit>_5, _6, ... units (the pre-2026-11 behaviour)')
     parser.add_argument('--excludeTracks', type=str, default='',
                         metavar='"N N ..."',
                         help='Tracks never to scan, as one quoted space- or '
@@ -766,6 +874,7 @@ def main():
                 check=args.check, noSplit=args.noSplit,
                 noBreakGap=args.noBreakGap,
                 noMoveOutOfRange=args.noMoveOutOfRange,
+                noLateUnits=args.noLateUnits,
                 excludeTracks=[int(x) for x in
                                args.excludeTracks.replace(',', ' ')
                                .split()])
