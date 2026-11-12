@@ -6,6 +6,8 @@ When the system `zip` binary is available it is used directly (~10 s for a typic
 
 **Tested on both Sentinel-1 SLC and L0 products.**
 
+To avoid downloading the cross-pol in the first place, see [`remoteReduceS1`](remoteReduceS1.md), which fetches only the kept members from ASF.
+
 > **Note:** `zip` may print a directory-mismatch warning when removing entries. This does not affect the integrity of the reduced file.
 
 ---

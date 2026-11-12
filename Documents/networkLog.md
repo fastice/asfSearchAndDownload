@@ -21,6 +21,9 @@ Written by:
   resumed partial counts in full, and a failed one (status ≠ 0) may count its preallocated size.
 - `refreshS1Orbits`, `downloadNISARoptimized`, `downloadRSLCSubset`, once per file
   (bytes actually fetched).
+- `remoteReduceS1` (autoupdateS1 with `remoteReduce: true`, as
+  `autoupdateS1/remoteReduceS1`), once per file: bytes actually fetched; the
+  MB/s includes the ~20 s CRC verify, so it reads below the transfer rate.
 - `logNetworkUse`, one row per `aria2c -i` session in a shell script, e.g. the Antarctic
   GCOV `gcovDownload.sh`:
 

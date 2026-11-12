@@ -18,6 +18,8 @@ pip install git+https://github.com/fastice/asfSearchAndDownload.git@main
 
 **reduces1** removes unwanted files from Sentinel-1 ZIP archives by filename pattern. The primary use-case is stripping cross-polarisation (HV or VH) data from dual-pol SLC or L0 products, roughly halving the archive size for users who only need single-pol data. It has been tested successfully on both Sentinel-1 SLC and L0 products. [Documentation](Documents/reduceSentinel1.md)
 
+**remoteReduceS1** downloads a Sentinel-1 SLC zip from ASF without its cross-pol members, using HTTP range requests, which combines the download and `reduces1` into one step at about half the network traffic. Every member is CRC-checked before the zip gets its real name, and `--limit` caps the combined rate in MB/s. `autoupdateS1` uses it when `remoteReduce: true`. [Documentation](Documents/remoteReduceS1.md)
+
 **refreshS1Orbits** refreshes a local Sentinel-1 precise-orbit (EOF) archive from ASF, downloading any orbit files newer than those already held. [Documentation](Documents/refreshS1Orbits.md)
 
 ### NISAR slim downloads
