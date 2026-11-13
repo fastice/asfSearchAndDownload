@@ -36,8 +36,11 @@ and `autoupdate.yaml` will grow to carry their config.
    **`remoteReduce: true`** (opt-in, added 2026-11-12) replaces aria2c + reduce
    with [`remoteReduceS1`](remoteReduceS1.md): each zip is fetched already
    reduced with HTTP range requests (the cross-pol is never downloaded, so
-   about half the traffic) and CRC-checked before it gets its real name, then
-   goes straight to filing, with no reduce thread. Retries, the retry pass and the
+   about half the traffic). Its CRC check (~20 s) runs in a background thread
+   while the next granule downloads; only then does the zip get its real name
+   and go to filing, with no reduce thread. A granule that fails the check is
+   deleted and joins the retry pass (2026-11-13; before that the check ran
+   inline and added ~20 s per granule). Retries, the retry pass and the
    cap work as above. The connection count still follows ariaDownload's time
    of day (or `--connections`), and `maxRate` caps the combined rate in MB/s.
 

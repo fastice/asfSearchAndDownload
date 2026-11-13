@@ -1132,15 +1132,16 @@ def downloadOne(url, monthDir, maxAttempts=3, extraArgs=()):
 
 
 def remoteDownloadOne(url, monthDir, pattern, maxAttempts=3, connections=None,
-                      maxRate=0.):
+                      maxRate=0., verify=True):
     '''
     Fetch a granule already reduced -- the members matching pattern are never
     downloaded -- into monthDir via remoteReduceS1, retrying up to maxAttempts.
-    Every attempt CRC-checks each kept member before the zip appears under its
-    real name, so there is no separate verify or reduce step. connections
-    defaults to ariaDownload's time-of-day count; maxRate is the combined cap
-    in MB/s over all connections (0 = none). Returns the zip path on success,
-    else None.
+    With verify, every attempt CRC-checks each kept member before the zip
+    appears under its real name, so there is no separate reduce step; without
+    it the unverified <name>.zip.part path is returned for _verifyWorker.
+    connections defaults to ariaDownload's time-of-day count; maxRate is the
+    combined cap in MB/s over all connections (0 = none). Returns the path on
+    success, else None.
     '''
     os.makedirs(monthDir, exist_ok=True)
     name = os.path.basename(url)
@@ -1152,7 +1153,7 @@ def remoteDownloadOne(url, monthDir, pattern, maxAttempts=3, connections=None,
         try:
             return remoteReduceS1.fetchReduced(
                 url, monthDir, pattern, nConn, maxRate,
-                program='autoupdateS1/remoteReduceS1')
+                program='autoupdateS1/remoteReduceS1', verify=verify)
         except Exception as exc:  # retried; one bad granule must not end the run
             log.warning(f'{name} remote reduce attempt {attempt} failed: '
                         f'{exc}')
@@ -1187,6 +1188,28 @@ def _reduceWorker(zipPath, pattern, pipeline=None):
         log.error(f'not filing {name}: zip unsound after a failed reduce')
         return
     pipeline.submit(zipPath)
+
+
+def _verifyWorker(partPath, url, verified, failed, pipeline=None):
+    '''
+    CRC-check a remoteReduce .part (runs in a background thread, overlapping
+    the next fetch), rename it to .zip and hand it to the filing pipeline. A
+    granule that fails is removed and its url appended to failed, for the
+    retry pass.
+    '''
+    name = os.path.basename(partPath)[:-len('.part')]
+    try:
+        zipPath = remoteReduceS1.verifyReduced(partPath)
+    except Exception as exc:  # keep one bad zip from killing the run
+        log.error(f'CRC check failed for {name}: {exc}')
+        if os.path.exists(partPath):
+            os.remove(partPath)
+        failed.append(url)
+        return
+    log.info(f'verified (CRC): {name}')
+    verified.append(zipPath)
+    if pipeline is not None:
+        pipeline.submit(zipPath)
 
 
 def startReduce(zipPath, pattern, threads, pipeline=None):
@@ -1674,17 +1697,24 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
         summary.add('download mode', f'remoteReduce, cap {maxRate or "none"} '
                     'MB/s')
 
-    def fetch(url, monthDir):
+    def fetch(url, monthDir, verify=True):
         if remote:
             return remoteDownloadOne(url, monthDir, reducePattern, maxAttempts,
                                      getattr(args, 'connections', None),
-                                     maxRate)
+                                     maxRate, verify)
         return downloadOne(url, monthDir, maxAttempts,
                            extraArgs=ariaExtraArgs(args))
 
-    def reduceAndFile(zipPath):
+    def reduceAndFile(zipPath, url):
         if not remote:
             startReduce(zipPath, reducePattern, reduceThreads, pipeline)
+            return
+        if zipPath.endswith('.part'):  # CRC check overlaps the next fetch
+            thread = threading.Thread(target=_verifyWorker,
+                                      args=(zipPath, url, remoteReduced,
+                                            verifyFailed, pipeline))
+            thread.start()
+            verifyThreads.append(thread)
             return
         remoteReduced.append(zipPath)
         if pipeline is not None:
@@ -1695,6 +1725,8 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
     # datatake) as the last one downloaded, so a pass is never left half-fetched.
     reduceThreads = []
     remoteReduced = []
+    verifyThreads = []
+    verifyFailed = []
     nDownloaded = nSkipped = nFailed = nDuplicates = 0
     failedUrls = []
     lastPassKey = None
@@ -1739,7 +1771,8 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
                 nDownloaded += 1
                 lastPassKey = thisPassKey
                 continue
-            zipPath = fetch(url, monthDir)
+            # A replacement is verified before the copy it supersedes goes.
+            zipPath = fetch(url, monthDir, verify=action == DUP_REPLACE)
             if zipPath is None:
                 nFailed += 1
                 failedUrls.append(url)
@@ -1751,7 +1784,15 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
             # can file it, so the unit never holds both copies at once.
             if action == DUP_REPLACE:
                 retireDuplicate(archiveDir, held, heldUnit)
-            reduceAndFile(zipPath)
+            reduceAndFile(zipPath, url)
+
+        # Granules whose background CRC check failed join the retry pass.
+        for thread in verifyThreads:
+            thread.join()
+        if verifyFailed:
+            nDownloaded -= len(verifyFailed)
+            nFailed += len(verifyFailed)
+            failedUrls.extend(verifyFailed)
 
         # 3b. Retry the failures once at the end of the run. Exhausting all
         # attempts in a few seconds usually means a brief ASF-side outage rather
@@ -1774,7 +1815,7 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
                 nDownloaded += 1
                 nRecovered += 1
                 log.info(f'downloaded on retry: {name} -> {monthDir}')
-                reduceAndFile(zipPath)
+                reduceAndFile(zipPath, url)
             log.info(f'retry pass: recovered {nRecovered} of '
                      f'{len(failedUrls)}')
             summary.add('retry pass',
@@ -1784,7 +1825,7 @@ def downloadStage(config, args, archiveDir, sensors, reducePattern, maxAttempts,
         # Producers first, then the consumers: nothing may still be able to
         # submit when the sentinels go in. The filing workers are not daemons,
         # so skipping this on an interrupt would hang the interpreter at exit.
-        for thread in reduceThreads:
+        for thread in reduceThreads + verifyThreads:
             thread.join()
         if pipeline is not None:
             pipeline.shutdown()

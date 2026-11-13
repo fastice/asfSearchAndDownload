@@ -37,9 +37,12 @@ Earthdata credentials come from `~/.netrc`, as for aria2c.
    central directory is written for the kept members (zip64 extras
    regenerated).
 5. **Verify**: each local header must name its member, then `testzip()`
-   decompresses every member and checks its CRC-32 against ASF's own. Only
-   then is the file renamed to `<name>.zip`. A failure raises and leaves at
-   most the `.part`.
+   (`verifyReduced`) decompresses every member and checks its CRC-32 against
+   ASF's own. Only then is the file renamed to `<name>.zip`. A failure raises
+   and leaves at most the `.part`. `fetchReduced(..., verify=False)` stops
+   before `testzip()` and returns the `.part` path, so a caller can run
+   `verifyReduced` in a thread while the next fetch proceeds; autoupdateS1
+   does this.
 
 The member bytes are copied, not recompressed, so the payload and CRCs are
 identical to an aria2c download reduced with `zip -d` (checked on two 5 GB
@@ -52,7 +55,7 @@ Stalling the socket read lets TCP slow the sender, so the link itself is
 throttled, as with aria2c's `--max-overall-download-limit`.
 
 Each fetch appends one record to the network log (`networkLog.md`), program
-`<caller>/remoteReduceS1`. Its MB/s figure includes the verify time.
+`<caller>/remoteReduceS1`. Since 2026-11-13 its time and MB/s cover the fetch only, not the verify.
 
 ## Timing (helheim, 5 GB S1C granule, 2.5 GB kept)
 
@@ -61,11 +64,13 @@ Each fetch appends one record to the network log (`networkLog.md`), program
 | aria2c -x 10 + `zip -d` | 53-77 s, 5.0 GB transferred |
 | `--nConn 10`, no cap | plan 3 s + fetch 26-39 s + verify 21 s |
 | `--nConn 10 --limit 20` | fetch 129 s (19.9 MB/s) |
-| `--nConn 10 --limit 40` (autoupdateS1) | 89 s in all |
+| `--nConn 10 --limit 40` (autoupdateS1, inline verify) | 89 s in all |
+| `--nConn 10 --limit 40` (autoupdateS1, verify overlapped) | 67 s per granule (2026-11-13) |
 
 The verify, about 21 s and single-threaded, is the price of checking that
 the ~45 separately fetched pieces landed correctly. aria2c's own check only
-confirms the byte count.
+confirms the byte count. In autoupdateS1 it overlaps the next fetch, so it
+costs no wall time except on the last granule.
 
 ## Not supported
 

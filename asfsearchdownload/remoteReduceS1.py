@@ -155,13 +155,32 @@ def planWork(keep, gap, chunk):
     return [(s, min(b, s + chunk)) for a, b in runs for s in range(a, b, chunk)]
 
 
+def verifyReduced(partPath):
+    '''
+    CRC-check every member of a fetched <name>.zip.part, then rename it to
+    <name>.zip and return that path. Raises on a CRC failure, leaving the .part.
+    '''
+    t0 = time.time()
+    with zipfile.ZipFile(partPath) as zc:
+        bad = zc.testzip()
+    if bad is not None:
+        raise RuntimeError(f'CRC failure in {bad}; leaving {partPath}')
+    finalPath = partPath[:-len('.part')]
+    os.replace(partPath, finalPath)
+    print(f'{os.path.basename(finalPath)}: verify {time.time() - t0:.1f} s',
+          flush=True)
+    return finalPath
+
+
 def fetchReduced(url, outputDir, pattern='hv', nConn=1, limit=0., gap=4 * MB,
-                 chunk=64 * MB, program=None):
+                 chunk=64 * MB, program=None, verify=True):
     '''
     Fetch url's zip minus the members whose names contain pattern into
     outputDir; return the final zip path. Raises on any failure, leaving at
     most <name>.zip.part behind. limit is the combined download cap in MB/s
     (2**20 bytes, as aria2c's M) over all nConn connections; 0 = none.
+    verify=False skips the CRC check and returns the <name>.zip.part path, so
+    the caller can run verifyReduced on it while the next fetch proceeds.
     '''
     t0 = time.time()
     start = now()
@@ -213,7 +232,7 @@ def fetchReduced(url, outputDir, pattern='hv', nConn=1, limit=0., gap=4 * MB,
                 zout.filelist.append(z)
                 zout.NameToInfo[z.filename] = z
 
-    # Verify: each local header names its member, then every CRC.
+    # Each local header names its member (cheap); the CRCs are verifyReduced.
     with open(partPath, 'rb') as f:
         for z, a, _ in keep:
             f.seek(outOffset[a])
@@ -221,23 +240,15 @@ def fetchReduced(url, outputDir, pattern='hv', nConn=1, limit=0., gap=4 * MB,
             nLen = struct.unpack('<H', hdr[26:28])[0]
             if hdr[:4] != b'PK\x03\x04' or f.read(nLen).decode() != z.filename:
                 raise RuntimeError(f'local header mismatch for {z.filename}')
-    with zipfile.ZipFile(partPath) as zc:
-        bad = zc.testzip()
-    if bad is not None:
-        raise RuntimeError(f'CRC failure in {bad}; leaving {partPath}')
-    tVerify = time.time() - t0 - tPlan - tFetch
-    finalPath = os.path.join(outputDir, name)
-    os.replace(partPath, finalPath)
     print(f'{name}: kept {len(keep)}/{len(infos)} members, '
           f'{dataEnd / MB:.0f} of {reader.size / MB:.0f} MB '
           f'(fetched {fetched / MB:.0f} MB in {len(work)} pieces, '
           f'{reader.nRequests} requests)\n'
           f'  plan {tPlan:.1f} s  fetch {tFetch:.1f} s '
-          f'({fetched / MB / tFetch:.1f} MB/s)  verify {tVerify:.1f} s',
-          flush=True)
+          f'({fetched / MB / tFetch:.1f} MB/s)', flush=True)
     logTransfer(program or f'{callerName()}/remoteReduceS1', name, fetched,
                 start, now(), connections=nConn)
-    return finalPath
+    return verifyReduced(partPath) if verify else partPath
 
 
 def main():
